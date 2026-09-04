@@ -1,0 +1,20 @@
+# Build products
+.build/
+DerivedData/
+Recents.app/
+
+# Xcode / SwiftPM per-user state
+**/xcuserdata/
+*.xcuserstate
+
+# Generated knowledge graph (regenerate with /graphify)
+graphify-out/
+
+# macOS
+.DS_Store
+
+# Claude Code local machine state
+.claude/settings.local.json
+
+# Local keychain helper, not distributed
+make-signing-identity.sh
