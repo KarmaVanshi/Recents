@@ -195,4 +195,83 @@ struct DockPreviewLayoutTests {
             previous = layout.rowWidth
         }
     }
+
+    // MARK: - Which thumbnail the pointer is on
+
+    /// This is the hover highlight, decided in arithmetic rather than by
+    /// SwiftUI, because SwiftUI's hover stopped following the pointer in a
+    /// panel that cannot become key — see `thumbnailIndex(at:)`.
+    private var threeAcross: DockPreviewLayout {
+        DockPreviewLayout(
+            sourceSizes: Array(repeating: size(1600, 1000), count: 3), availableWidth: laptop
+        )
+    }
+
+    /// A point inside the picture of thumbnail `index`, or beside it when
+    /// `offset` pushes it out.
+    private func inside(_ layout: DockPreviewLayout, _ index: Int, dx: CGFloat = 0) -> CGPoint {
+        let left = DockPreviewLayout.padding
+            + layout.widths[..<index].reduce(0, +)
+            + DockPreviewLayout.spacing * CGFloat(index)
+        let top = DockPreviewLayout.padding + DockPreviewLayout.headerHeight
+            + DockPreviewLayout.headerGap
+        return CGPoint(x: left + layout.widths[index] / 2 + dx, y: top + layout.height / 2)
+    }
+
+    @Test("A point inside a picture is that thumbnail, whichever one it is")
+    func pointInsideAPicture() {
+        let layout = threeAcross
+        for index in 0..<3 {
+            #expect(layout.thumbnailIndex(at: inside(layout, index)) == index)
+        }
+    }
+
+    @Test("Every point along a sweep resolves to the thumbnail under it, in order")
+    func sweepAcrossTheRow() {
+        let layout = threeAcross
+        var seen: [Int] = []
+        var x: CGFloat = 0
+        while x < layout.rowWidth + DockPreviewLayout.padding * 2 {
+            if let index = layout.thumbnailIndex(at: CGPoint(x: x, y: inside(layout, 0).y)),
+               seen.last != index {
+                seen.append(index)
+            }
+            x += 4
+        }
+        #expect(seen == [0, 1, 2])
+    }
+
+    @Test("The gap between two pictures is nobody's")
+    func gapBetweenPictures() {
+        let layout = threeAcross
+        let gap = CGPoint(
+            x: inside(layout, 0).x + layout.widths[0] / 2 + DockPreviewLayout.spacing / 2,
+            y: inside(layout, 0).y
+        )
+        #expect(layout.thumbnailIndex(at: gap) == nil)
+    }
+
+    @Test("The header and the padding around the row are nobody's")
+    func headerAndPaddingAreNotThumbnails() {
+        let layout = threeAcross
+        let header = CGPoint(x: inside(layout, 1).x, y: DockPreviewLayout.padding + 4)
+        #expect(layout.thumbnailIndex(at: header) == nil)
+        #expect(layout.thumbnailIndex(at: CGPoint(x: 2, y: inside(layout, 0).y)) == nil)
+        #expect(layout.thumbnailIndex(at: inside(layout, 2, dx: layout.widths[2])) == nil)
+    }
+
+    /// The caption sits under the picture and names it; pointing at the name
+    /// is pointing at the thumbnail.
+    @Test("The caption below a picture still counts as that thumbnail")
+    func captionBelongsToItsThumbnail() {
+        let layout = threeAcross
+        let caption = CGPoint(x: inside(layout, 1).x, y: inside(layout, 1).y + layout.height / 2 + 10)
+        #expect(layout.thumbnailIndex(at: caption) == 1)
+    }
+
+    @Test("An empty row has no thumbnail anywhere")
+    func emptyRowHasNoThumbnails() {
+        let layout = DockPreviewLayout(sourceSizes: [], availableWidth: laptop)
+        #expect(layout.thumbnailIndex(at: CGPoint(x: 50, y: 80)) == nil)
+    }
 }

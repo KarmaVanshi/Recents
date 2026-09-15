@@ -9,17 +9,24 @@ import AppKit
 /// light. So a tile has to be held for `dwell` before it is reported, exactly as
 /// the Dock does before showing its own name label.
 ///
-/// Cost is kept off the common path deliberately. A global mouse-moved monitor
-/// sees every pointer movement on the system, so the first thing each event does
-/// is a rectangle test against the Dock's strip — no interprocess traffic, no
-/// allocation. Only a pointer actually inside the Dock reaches the accessibility
-/// hit test, and even then no faster than `hitTestInterval`.
+/// Cost is kept off the common path deliberately. The tap sees every pointer
+/// movement on the system, so the first thing each event does is a rectangle
+/// test against the Dock's strip — no interprocess traffic, no allocation. Only
+/// a pointer actually inside the Dock reaches the accessibility hit test, and
+/// even then no faster than `hitTestInterval`.
 ///
 /// Mouse events are used rather than polling because they cost nothing when the
-/// pointer is still, which is most of the time. Note that they stop arriving
-/// while the pointer is over one of this app's own windows — a global monitor
-/// only sees events destined for *other* processes — so whoever consumes this
-/// is responsible for noticing the pointer entering its own panel.
+/// pointer is still, which is most of the time. They come from a listen-only
+/// `CGEvent` tap rather than `NSEvent`'s global monitor, and the difference is
+/// not a matter of taste. While this process held a global monitor for
+/// mouse-moved events, the window server all but stopped delivering mouse-moved
+/// events to this app's own preview panel: `DockSweepSelfTest` measured five
+/// reaching the panel across a sweep that put a hundred and ninety on the
+/// system, the rest arriving at the *global* monitor as though the panel were
+/// some other application's window — so the highlight sat on one thumbnail
+/// while the pointer crossed the other two. With a session tap in its place the
+/// panel receives every event the display refresh allows, and the tap sees the
+/// ones over this app's windows as well, which the monitor never did.
 @MainActor
 final class DockHoverWatcher {
 
@@ -47,11 +54,44 @@ final class DockHoverWatcher {
     /// tile it is not aiming at.
     private let dwell: TimeInterval = 0.12
 
-    /// Floor on how often the Dock is asked what is under the pointer. Forty a
-    /// second is finer than the dwell it feeds — a hit test must never be the
+    /// Whether the consumer currently has a preview on screen. Set by whoever
+    /// consumes `onTile`.
+    ///
+    /// A pointer that has settled on one tile and then moves to the next is
+    /// browsing, not passing through, and there is no dwell at all in that
+    /// state: the next tile is reported the moment the pointer is on it. The
+    /// strobing the dwell exists to prevent is the thing the user is now doing
+    /// on purpose — the taskbar on Windows switches thumbnails instantly in the
+    /// same state, and the Dock's own labels follow the pointer tile by tile —
+    /// and a short chained dwell measured as nothing but lag: 40 ms of waiting
+    /// in front of 8 ms of work, on every tile.
+    var isShowingPreview = false {
+        didSet {
+            if oldValue && !isShowingPreview { browsingUntil = Date().addingTimeInterval(browsingGrace) }
+        }
+    }
+
+    /// How long after a preview goes the pointer still counts as browsing.
+    ///
+    /// The tiles along a Dock are mostly not running, and a preview crossing
+    /// one of them is dismissed — there is nothing to show for it. Without this
+    /// the next running tile would then be back to the full dwell, and walking
+    /// along a mixed Dock would alternate between instant and slow. Long enough
+    /// to cross a few idle tiles, short enough that a preview dismissed by
+    /// leaving the Dock does not come back instantly on a later, unrelated pass.
+    private let browsingGrace: TimeInterval = 0.4
+    private var browsingUntil: Date = .distantPast
+
+    private var isBrowsing: Bool { isShowingPreview || Date() < browsingUntil }
+
+    /// Floor on how often the Dock is asked what is under the pointer. Once a
+    /// frame is finer than the dwell it feeds — a hit test must never be the
     /// reason a preview is late — and it still bounds the interprocess traffic a
-    /// fast drag across the Dock can generate.
-    private let hitTestInterval: TimeInterval = 0.025
+    /// fast drag across the Dock can generate. A movement that lands inside the
+    /// window is held until the window ends rather than dropped, so the last
+    /// movement before the pointer comes to rest — the one that says where it
+    /// stopped — is always tested.
+    private let hitTestInterval: TimeInterval = 0.016
 
     /// Movement below this is treated as the pointer standing still. Optical
     /// mice jitter by a point or two at rest, which would otherwise re-run the
@@ -64,9 +104,15 @@ final class DockHoverWatcher {
 
     // MARK: - State
 
+    /// The mouse-moved tap and the click monitor. See `start`.
+    private var tap: CFMachPort?
+    private var tapSource: CFRunLoopSource?
     private var monitors: [Any] = []
     private var lastHitTest: Date = .distantPast
     private var lastPoint: CGPoint = .zero
+
+    /// A hit test held back by `hitTestInterval`, to run when the window ends.
+    private var deferredHitTest: Timer?
 
     /// The tile the pointer is over but has not yet held long enough, and when
     /// it arrived there.
@@ -74,6 +120,17 @@ final class DockHoverWatcher {
 
     /// The tile last reported through `onTile`, so a repeat is not reported.
     private var reported: DockProbe.Tile?
+
+    /// A tile the user has just clicked, which is not reported again until the
+    /// pointer has left it.
+    ///
+    /// A click on a tile launches or raises something, and the pointer is
+    /// usually still resting on the tile while that happens. Without this the
+    /// next point or two of jitter began a fresh dwell and put the preview
+    /// straight back up — over the very window the click had just brought
+    /// forward. The suppression ends when the pointer moves onto a different
+    /// tile or off the Dock, which is the user saying they are done with it.
+    private var suppressed: DockProbe.Tile?
 
     /// Fires while the pointer is standing on a tile that has not yet been held
     /// long enough. Mouse-moved events cannot deliver the dwell on their own: a
@@ -85,23 +142,52 @@ final class DockHoverWatcher {
 
     private init() {}
 
-    var isRunning: Bool { !monitors.isEmpty }
+    var isRunning: Bool { tap != nil || !monitors.isEmpty }
 
     // MARK: - Lifecycle
 
     func start() {
         guard !isRunning else { return }
 
-        let moved = NSEvent.addGlobalMonitorForEvents(
-            matching: [.mouseMoved],
-            handler: { _ in
-                MainActor.assumeIsolated {
-                    DockHoverWatcher.shared.pointerMoved(to: NSEvent.mouseLocation)
+        // Listen-only, and on the main run loop, so the callback is on the
+        // thread everything else here runs on. A tap for pointer movement needs
+        // Accessibility, which reading the Dock needs anyway; refused, there is
+        // no pointer to watch and the feature is quietly off, exactly as it is
+        // without the Dock.
+        let callback: CGEventTapCallBack = { _, type, event, _ in
+            MainActor.assumeIsolated {
+                let watcher = DockHoverWatcher.shared
+                switch type {
+                case .tapDisabledByTimeout, .tapDisabledByUserInput:
+                    // The system switches a tap off if its callback ever runs
+                    // long, and says so by sending it this. Left off, previews
+                    // would stop for the rest of the session the first time
+                    // the machine was briefly busy.
+                    if let tap = watcher.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                default:
+                    watcher.pointerMoved(to: NSEvent.mouseLocation)
                 }
             }
-        )
-        if let moved { monitors.append(moved) }
+            return Unmanaged.passUnretained(event)
+        }
+        if let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(1 << CGEventType.mouseMoved.rawValue),
+            callback: callback,
+            userInfo: nil
+        ) {
+            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            self.tap = tap
+            tapSource = source
+        }
 
+        // Clicks stay on a global monitor: a click on a Dock tile is aimed at
+        // another process, which is exactly what a monitor sees, and a monitor
+        // for mouse *down* has shown none of the mouse-moved trouble above.
         let clicked = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown],
             handler: { _ in
@@ -122,12 +208,21 @@ final class DockHoverWatcher {
     }
 
     func stop() {
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }
+            CFMachPortInvalidate(tap)
+        }
+        tap = nil
+        tapSource = nil
         monitors.forEach(NSEvent.removeMonitor)
         monitors.removeAll()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
+        cancelDeferredHitTest()
         cancelDwell()
         pending = nil
+        suppressed = nil
         if reported != nil {
             reported = nil
             onTile?(nil)
@@ -137,13 +232,21 @@ final class DockHoverWatcher {
     // MARK: - Events
 
     private func clicked() {
+        // Whichever tile the pointer was on — settled or still dwelling — is the
+        // one the click was aimed at.
+        suppressed = reported ?? pending?.tile
         pending = nil
+        cancelDeferredHitTest()
         cancelDwell()
         if reported != nil {
             reported = nil
             onTile?(nil)
         }
         onClick?()
+        // A click is the user done browsing: the next tile earns its preview
+        // with a full dwell again. After the callback, which hides the panel
+        // and would otherwise re-arm the grace on the way out.
+        browsingUntil = .distantPast
     }
 
     private func pointerMoved(to point: CGPoint) {
@@ -169,12 +272,48 @@ final class DockHoverWatcher {
             return
         }
 
-        guard Date().timeIntervalSince(lastHitTest) >= hitTestInterval else { return }
+        let sinceLast = Date().timeIntervalSince(lastHitTest)
+        guard sinceLast >= hitTestInterval else {
+            deferHitTest(by: hitTestInterval - sinceLast)
+            return
+        }
+        hitTest(at: point)
+    }
+
+    private func deferHitTest(by delay: TimeInterval) {
+        guard deferredHitTest == nil else { return }
+        let timer = Timer(timeInterval: delay, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                let watcher = DockHoverWatcher.shared
+                watcher.deferredHitTest = nil
+                // Where the pointer is now, not where it was when the movement
+                // was held back.
+                watcher.hitTest(at: NSEvent.mouseLocation)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        deferredHitTest = timer
+    }
+
+    private func cancelDeferredHitTest() {
+        deferredHitTest?.invalidate()
+        deferredHitTest = nil
+    }
+
+    private func hitTest(at point: CGPoint) {
+        cancelDeferredHitTest()
         lastHitTest = Date()
 
         guard let tile = DockProbe.tile(at: point) else {
             leaveTile()
             return
+        }
+
+        // Still on the tile that was just clicked: nothing to report. Any other
+        // tile ends the suppression.
+        if let suppressed {
+            guard !suppressed.isSameTile(as: tile) else { return }
+            self.suppressed = nil
         }
 
         // Already reported and unchanged: nothing to do but keep the frame
@@ -190,8 +329,21 @@ final class DockHoverWatcher {
             return
         }
 
-        // A new tile. Anything already on screen is for a different tile and is
-        // now wrong, so it goes at once rather than at the end of the new dwell.
+        // A new tile, with the pointer browsing: reported at once, and as a
+        // straight switch rather than a leave followed by an arrival, so the
+        // consumer replaces one preview with the next instead of being told
+        // there is nothing and then that there is something.
+        if isBrowsing {
+            pending = nil
+            cancelDwell()
+            reported = tile
+            onTile?(tile)
+            return
+        }
+
+        // A new tile, from cold. Anything already on screen is for a different
+        // tile and is now wrong, so it goes at once rather than at the end of
+        // the new dwell.
         if reported != nil {
             reported = nil
             onTile?(nil)
@@ -202,6 +354,8 @@ final class DockHoverWatcher {
 
     private func leaveTile() {
         pending = nil
+        suppressed = nil
+        cancelDeferredHitTest()
         cancelDwell()
         guard reported != nil else { return }
         reported = nil
@@ -236,10 +390,19 @@ final class DockHoverWatcher {
         // event this watcher saw — a Space switch, a window opening under the
         // cursor — and reporting a tile the pointer has since left would show a
         // preview attached to nothing.
-        guard let current = DockProbe.tile(at: NSEvent.mouseLocation),
-              current.isSameTile(as: pending.tile)
-        else {
+        guard let current = DockProbe.tile(at: NSEvent.mouseLocation) else {
             self.pending = nil
+            return
+        }
+
+        // On a different tile than the one the dwell was started for: that tile
+        // begins its own dwell, exactly as it would have had the movement onto
+        // it been seen. Giving up here instead left nothing pending and nothing
+        // coming — a pointer at rest sends no more events — so a tile reached
+        // just as the previous dwell ran out never got its preview at all.
+        guard current.isSameTile(as: pending.tile) else {
+            self.pending = (current, Date())
+            startDwell()
             return
         }
 

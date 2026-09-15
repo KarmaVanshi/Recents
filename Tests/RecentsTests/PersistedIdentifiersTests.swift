@@ -31,6 +31,7 @@ struct PersistedIdentifiersTests {
 
     @Test("Summon gesture raw values likewise")
     func summonGestureRawValues() {
+        #expect(SummonGesture.twoFingerTap.rawValue == "twoFingerTap")
         #expect(SummonGesture.threeFingerTap.rawValue == "threeFingerTap")
         #expect(SummonGesture.fourFingerTap.rawValue == "fourFingerTap")
         #expect(SummonGesture.fiveFingerTap.rawValue == "fiveFingerTap")
@@ -51,11 +52,21 @@ struct PersistedIdentifiersTests {
         }
     }
 
-    @Test("The default summon gesture is the one that was actually measured")
+    @Test("The default summon gesture is a two-finger tap, and a single one")
     func summonGestureDefault() {
-        #expect(SummonGesture.default == .threeFingerTap)
-        #expect(SummonGesture.default.fingerCount == 3)
+        #expect(SummonGesture.default == .twoFingerTap)
+        #expect(SummonGesture.default.fingerCount == 2)
+        // Single, and this is the half that must not drift: a two-finger *double*
+        // tap is smart zoom, on by default, and there is no reading of the
+        // hardware that separates them — see `SummonGesture`.
         #expect(SummonGesture.default.tapCount == 1)
+    }
+
+    @Test("Two fingers are offered as a tap only, never as a double tap")
+    func twoFingersAreNeverADoubleTap() {
+        for gesture in SummonGesture.allCases where gesture.fingerCount == 2 {
+            #expect(gesture.tapCount == 1)
+        }
     }
 
     // MARK: - What Clear Menu reaches

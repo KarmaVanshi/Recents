@@ -83,13 +83,9 @@ struct DockPreviewView: View {
     let onClose: (WindowServerCapture.WindowRef) -> Bool
     let onZoom: (WindowServerCapture.WindowRef) -> Bool
     /// Clicking a remembered still, which has no window to act on: reopen the
-    /// document it shows, or failing that the app. See `DockWindows.open`.
-    let onOpen: () -> Void
-    /// A thumbnail gaining or losing the pointer, by position in the row. The
-    /// controller turns that into the selection — the highlight, and what Return
-    /// acts on. It does not change how often anything is captured: every
-    /// thumbnail in the row is live whether the pointer is on it or not.
-    let onHover: (Int, Bool) -> Void
+    /// document it shows, or failing that the app. Reports whether there was an
+    /// application to ask at all. See `DockWindows.open`.
+    let onOpen: () -> Bool
 
     /// Built here rather than inherited, because this view is the root of its
     /// own hosting view in a panel of its own — there is no deck above it to
@@ -153,14 +149,12 @@ struct DockPreviewView: View {
                                 // A remembered still has no window to fail to
                                 // reach: opening a document is the app's job
                                 // from here, and it answers for itself.
-                                onOpen()
-                                return true
+                                return onOpen()
                             }
                             return onActivate(window)
                         },
                         onClose: source.window.map { window in { onClose(window) } },
-                        onZoom: source.window.map { window in { onZoom(window) } },
-                        onHover: { isInside in onHover(index, isInside) }
+                        onZoom: source.window.map { window in { onZoom(window) } }
                     )
                 }
             }
@@ -268,7 +262,7 @@ struct DockPreviewView: View {
     /// rather than on every pass of this view's body. See the `icon` property.
     static func icon(for target: DockWindows.Target) -> NSImage? {
         guard let url = target.applicationURL else { return nil }
-        return NSWorkspace.shared.icon(forFile: url.path)
+        return DeckIcon.forFile(url.path)
     }
 }
 
@@ -326,7 +320,6 @@ private struct DockThumbnail: View {
     let onActivate: () -> Bool
     let onClose: (() -> Bool)?
     let onZoom: (() -> Bool)?
-    let onHover: (Bool) -> Void
 
     @Environment(\.deckPalette) private var palette
 
@@ -334,9 +327,17 @@ private struct DockThumbnail: View {
     ///
     /// Some applications do not expose a minimized window through Accessibility
     /// at all — Notes, measured on macOS 26 — so there is no title-bar button
-    /// anywhere to press and no window to raise. Saying so is the only honest
-    /// thing left: a control that swallows the click and changes nothing reads
-    /// as a broken app rather than as a window that cannot be reached.
+    /// anywhere to press and no window to raise. For the two title-bar actions
+    /// that is the end of the road, and saying so is the only honest thing left:
+    /// a control that swallows the click and changes nothing reads as a broken
+    /// app rather than as a window that cannot be reached.
+    ///
+    /// Clicking the picture itself no longer stops there. A message is a poor
+    /// answer to "show me this window" when there is a second road to the same
+    /// place, so that click now asks the application for a window instead of
+    /// reporting that Accessibility would not give one up — see
+    /// `DockWindows.activateOrOpen`. What is left here is the case where there
+    /// is no application to ask, which is genuinely nothing but a message.
     ///
     /// It carries the verb rather than being a plain flag, because all three
     /// actions fail this way and "Couldn't close" over a maximise that did
@@ -386,7 +387,10 @@ private struct DockThumbnail: View {
                 .frame(width: width)
         }
         .contentShape(Rectangle())
-        .onHover { inside in onHover(inside) }
+        // No `.onHover` here: which thumbnail the pointer is on is decided by
+        // the controller from AppKit's mouse-moved events, because SwiftUI's
+        // hover does not follow the pointer in a window that cannot become
+        // key. See `DockPreviewLayout.thumbnailIndex(at:)`.
         .onTapGesture { attempt("reach it", onActivate) }
         .help(helpText)
         // The panel never takes key focus, so nothing here is reachable by tab —
@@ -397,7 +401,16 @@ private struct DockThumbnail: View {
         .accessibilityLabel(title)
         .accessibilityHint(helpText)
         .accessibilityAddTraits(.isButton)
-        .animation(.easeOut(duration: 0.12), value: isSelected)
+        // No `.animation` on `isSelected`, deliberately. The highlight used to
+        // ease over 0.12s, and every property it eased — the border's colour
+        // and width, the caption's colour — is drawn on the CPU, so each frame
+        // of the ease re-rasterised two thumbnails' captions and rings and then
+        // waited on the render server to take the buffer. Measured at ~50 ms of
+        // stalled main thread per thumbnail the pointer crossed, which read as
+        // the panel dragging behind the hand. An instant highlight is also what
+        // a hover highlight is: the Dock's own tiles do not ease into being
+        // pointed at.
+        //
         // Clears the complaint again so the panel does not keep an old one on
         // screen. A task rather than a queued block, because SwiftUI cancels it
         // when this thumbnail goes — which, the panel being driven by the

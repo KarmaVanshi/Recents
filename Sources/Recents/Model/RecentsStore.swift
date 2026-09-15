@@ -13,13 +13,13 @@ import Observation
 /// Four sources, each covering the others' gaps:
 ///   • `RecentApplications.sfl4` — the apps the user actually launched, in true
 ///     recency order. Headline content: these become window-screenshot cards.
-///   • `ApplicationRecentDocuments/com.apple.preview.sfl4` — the main deck's
-///     documents, and by default the only app's documents it carries. See
-///     `loadDocuments` for why the global `RecentDocuments.sfl4` does not feed
-///     the main rail by default: every other app's recents are one swipe behind
-///     that app's own card, so putting them in the main deck as well said the
-///     same thing twice. `Preferences.showAllFiles` swaps this source for every
-///     app's documents at once, for anyone who would rather have the flat rail.
+///   • Every app's recent documents — the per-app
+///     `ApplicationRecentDocuments/*.sfl4` lists unioned with the Apple menu's
+///     global `RecentDocuments.sfl4`, ordered by when each file was last used.
+///     This is the main deck's document rail. Turning `Preferences.showAllFiles`
+///     off narrows it back to `com.apple.preview.sfl4` alone, for anyone who
+///     would rather the main deck stayed a reading list and left every other
+///     app's files behind that app's own card. See `loadDocuments`.
 ///   • Spotlight — real timestamps for those documents, and the change feed that
 ///     tells us to look again.
 ///   • `OfficeRecentsReader` — Word, Excel and PowerPoint keep private MRU lists
@@ -123,8 +123,9 @@ final class RecentsStore {
     /// deck would put the whole cost between the hotkey and the first frame.
     ///
     /// Empty until that pass has run once, exactly like the chevrons: the first
-    /// summon after launch shows the global list alone and the build folds the
-    /// rest in with a second refresh. Only maintained while the preference is on.
+    /// summon after launch shows the global list alone — see `loadDocuments` —
+    /// and the build folds the rest in with a second refresh. Only maintained
+    /// while the preference is on.
     @ObservationIgnored private var cachedAllFilesOrder: [URL] = []
 
     /// What `showAllFiles` was on the last index build, so flipping it can force
@@ -460,15 +461,35 @@ final class RecentsStore {
         return item
     }
 
-    /// Reads `kMDItemLastUsedDate` directly for one file.
+    /// Reads `kMDItemLastUsedDate` for one file, through a short-lived cache.
     ///
     /// `SpotlightSource` deliberately filters app bundles out of its live query
     /// (they would swamp the document results), so applications need their
-    /// timestamp fetched individually. This is a cheap synchronous lookup and
-    /// there are only ever a couple of dozen apps.
+    /// timestamp fetched individually.
+    ///
+    /// The cache is not a nicety. This used to be described here as a cheap
+    /// synchronous lookup, and it is not one: `MDItemCopyAttribute` is a round
+    /// trip to the metadata server, measured at ~195µs a file. One per
+    /// application put `loadApplications` at 10-12ms of a 14-17ms refresh — and
+    /// `refresh()` runs on the main thread on every summon, between the hotkey
+    /// and the window appearing, and again on every debounced file-watcher fire,
+    /// which can land while the rail is mid-animation. A single refresh was
+    /// costing about one whole frame.
+    ///
+    /// A held value going stale is invisible, because everywhere it could go
+    /// stale something live is already overriding it. A *running* application's
+    /// card takes the newest of this and the launch and activation dates
+    /// observed in `loadApplications`, so switching to an app still reads as
+    /// switching to it; an application that is not running cannot be used
+    /// without launching it, which fires a refresh. A document used inside
+    /// Spotlight's week is answered from `spotlightDates` before this is ever
+    /// consulted. What is left — a document last opened over a week ago — cannot
+    /// change without becoming one of those two cases.
     private static func lastUsedDate(for url: URL) -> Date? {
-        guard let item = MDItemCreateWithURL(nil, url as CFURL) else { return nil }
-        return MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date
+        LastUsedDates.shared.date(for: url) { url in
+            guard let item = MDItemCreateWithURL(nil, url as CFURL) else { return nil }
+            return MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date
+        }
     }
 
     // MARK: - Servers
@@ -510,32 +531,29 @@ final class RecentsStore {
     /// Two possible sources, and the preference picks between them rather than
     /// blending them:
     ///
-    ///   • **Preview's own list** (the default) —
-    ///     `ApplicationRecentDocuments/com.apple.preview.sfl4`. This used to be
-    ///     the Apple menu's global `RecentDocuments.sfl4` merged with a week of
-    ///     Spotlight, which meant every file every app had touched landed in the
-    ///     main rail — and each of those apps already carries its own recents one
-    ///     swipe behind its card. The deck said the same thing twice, and the
-    ///     louder half was the flat, unattributed one. So by default the main
-    ///     deck answers a narrower question: what have you been *reading*.
-    ///     Preview is the app with no project and no workspace to expand into —
-    ///     a PDF opened there belongs nowhere else — so its list is the one that
-    ///     earns a place beside the app cards.
-    ///
-    ///   • **Every app's files** (`Preferences.showAllFiles`) — every per-app
-    ///     list unioned with the Apple menu's global one and ordered by
-    ///     timestamp. See `mergedDocumentOrder` for why the global list is not
-    ///     enough on its own, and why a timestamp order is the only one available
-    ///     across apps. These cards are marked `.spotlight` rather than
-    ///     `.sharedFileList` because that is exactly what they are: real
+    ///   • **Every app's files** (`Preferences.showAllFiles`, the default) —
+    ///     every per-app list unioned with the Apple menu's global one and
+    ///     ordered by timestamp. See `mergedDocumentOrder` for why the global
+    ///     list is not enough on its own, and why a timestamp order is the only
+    ///     one available across apps. These cards are marked `.spotlight` rather
+    ///     than `.sharedFileList` because that is exactly what they are: real
     ///     timestamps, and an order no shared file list vouches for.
     ///
-    /// In the default mode the list is read straight from its file rather than
+    ///   • **Preview's own list** —
+    ///     `ApplicationRecentDocuments/com.apple.preview.sfl4`. The narrow rail,
+    ///     for anyone who wants the main deck to answer "what have you been
+    ///     *reading*" and leave every other app's files one swipe behind that
+    ///     app's own card. Preview is the app with no project and no workspace
+    ///     to expand into — a PDF opened there belongs nowhere else — so its is
+    ///     the list that earns a place beside the app cards on its own.
+    ///
+    /// In the narrow mode the list is read straight from its file rather than
     /// filtered out of the cached ownership index, for two reasons. It is
     /// authoritative about order, where the index's `owners` map only records
-    /// which app happened to claim a URL first. And it is synchronous, so the
-    /// first summon after launch shows documents instead of waiting on the
-    /// background build — which the all-files rail, by its nature, cannot.
+    /// which app happened to claim a URL first. And it is synchronous, where the
+    /// merged rail has to wait on the background build — which is why that rail
+    /// falls back to the global list for the one refresh before the build lands
+    /// rather than showing nothing.
     private func loadDocuments(startingAt rank: inout Int) -> [RecentItem] {
         // Step 1 — the list, in its own order. A `.denied` here is the same TCC
         // signature as the other lists: the file exists and will not open, which
@@ -544,14 +562,22 @@ final class RecentsStore {
         var order: [URL] = []
 
         if showingEveryApp {
-            // Pre-merged and pre-sorted by the background pass. The global list
-            // is still read here, and only for its verdict: it is the one input
-            // to that merge that can come back `.denied`, and the Full Disk
-            // Access banner has to say so.
-            if case .denied = SharedFileListReader.read(.recentDocuments) {
-                documentsDenied = true
+            // The global list is read here for two things. Its verdict: it is
+            // the one input to the background merge that can come back
+            // `.denied`, and the Full Disk Access banner has to say so. And its
+            // contents, which stand in for the merged order until that pass has
+            // built one. That fallback matters now that this is the deck's
+            // default source: the merge lands about a quarter of a second after
+            // launch, and a rail that is empty until it does is a worse first
+            // impression than a short rail that grows. The merge is the better
+            // answer and replaces this the moment it arrives.
+            var globalList: [URL] = []
+            switch SharedFileListReader.read(.recentDocuments) {
+            case .denied: documentsDenied = true
+            case .missing: break
+            case .ok(let urls): globalList = urls
             }
-            order = cachedAllFilesOrder
+            order = cachedAllFilesOrder.isEmpty ? globalList : cachedAllFilesOrder
         } else {
             switch SharedFileListReader.readAppDocuments(bundleID: Self.previewBundleID) {
             case .denied:
@@ -563,7 +589,7 @@ final class RecentsStore {
             }
         }
 
-        // In the default mode every card came from Preview, so the badge is
+        // In the narrow mode every card came from Preview, so the badge is
         // Preview and is resolved once rather than per document. Showing every
         // app's files makes the question real, and it is answered per card in
         // `owningApplication(for:)` — but only for the cards that survive the
@@ -612,11 +638,12 @@ final class RecentsStore {
                 owningApp: nil, origin: showingEveryApp ? .spotlight : .sharedFileList
             )
             guard item.stillExists else { continue }
-            // Preview does not open folders, so in the default mode this is very
+            // Preview does not open folders, so in the narrow mode this is very
             // nearly dead code — but the preference means "no folders in the
             // deck", and a rule that quietly stops applying in one place is worse
             // than a redundant check. Reading every app's files is where it earns
-            // its keep: editors put their project directories in that list.
+            // its keep, and now that that is the default it earns it on every
+            // deck: editors put their project directories in that list.
             guard prefs.includeFolders || !item.isDirectory else { continue }
 
             available += 1

@@ -48,4 +48,33 @@ final class DockPreviewSelection: ObservableObject {
         guard let index else { return delta > 0 ? 0 : count - 1 }
         return max(0, min(count - 1, index + delta))
     }
+
+    /// Whether a keystroke belongs to the panel rather than to the application
+    /// the user is actually working in.
+    ///
+    /// The keys a preview answers are taken from the front application — that is
+    /// the whole reason `DockPreviewKeys` is a tap and not a monitor — so the
+    /// question of when to take them is the question of when the user is
+    /// addressing the panel at all. "Whenever a panel is on screen" is the wrong
+    /// answer and was the one in use: a preview appears after an eighth of a
+    /// second resting on a Dock tile and then stays up for as long as the
+    /// pointer is anywhere in the corridor between the tile and the panel, so a
+    /// pointer parked near the bottom of the screen silently ate ←, →, Escape,
+    /// Return and Space out of whatever the user was typing into. Nothing on
+    /// screen explained where the keys had gone.
+    ///
+    /// The pointer being inside the panel is the evidence, and it is the only
+    /// honest one available: the panel never becomes key, so it has no focus to
+    /// consult. A pointer on the tile is someone looking; a pointer on the
+    /// thumbnails is someone choosing between them — and moving onto them is the
+    /// same motion that highlights one, so nothing has to be learned to get the
+    /// keys to work.
+    ///
+    /// The margin lets a pointer resting on the panel's very edge still count.
+    nonisolated static func panelOwnsKeyboard(
+        panel: CGRect, pointer: CGPoint, margin: CGFloat = 6
+    ) -> Bool {
+        guard !panel.isEmpty else { return false }
+        return panel.insetBy(dx: -margin, dy: -margin).contains(pointer)
+    }
 }

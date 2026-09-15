@@ -18,8 +18,6 @@ struct ThumbnailImage: View {
     let url: URL
     let size: CGSize
 
-    @Environment(\.deckPalette) private var palette
-
     @State private var image: NSImage?
 
     /// Folders get icon treatment, never a filled preview. QuickLook happily
@@ -34,7 +32,7 @@ struct ThumbnailImage: View {
     var body: some View {
         ZStack {
             if isDirectory {
-                iconTreatment(NSWorkspace.shared.icon(forFile: url.path), scale: 0.44)
+                iconTreatment(DeckIcon.forFile(url.path), scale: 0.44)
             } else if let image {
                 // The ground stays behind the preview because aspect-fitting
                 // letterboxes anything whose proportions differ from the card,
@@ -50,7 +48,7 @@ struct ThumbnailImage: View {
                     )
                     .transition(.opacity)
             } else {
-                iconTreatment(NSWorkspace.shared.icon(forFile: url.path), scale: 0.38)
+                iconTreatment(DeckIcon.forFile(url.path), scale: 0.38)
             }
         }
         .animation(.easeOut(duration: 0.22), value: image != nil)

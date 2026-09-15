@@ -19,6 +19,15 @@ final class SettingsWindowController {
     /// has no deck behind it and simply offers the full range.
     var store: RecentsStore?
 
+    /// Whether the Settings window is on screen right now.
+    ///
+    /// For `MenuSelfTest`, which clicks the real status item and has to read
+    /// back what the click did. Whether a click on a status item reaches its
+    /// action at all is a fact about AppKit and the window server rather than
+    /// about this source, so the test presses the button rather than calling
+    /// `show()` and declaring victory.
+    var isShowing: Bool { window?.isVisible == true }
+
     func show() {
         if let window {
             NSApp.activate(ignoringOtherApps: true)
@@ -61,6 +70,7 @@ struct SettingsView: View {
     @State private var hasScreenRecording = AppWindowCapture.shared.hasPermission
     @State private var hasAccessibility = AppWindowCapture.shared.hasAccessibilityPermission
     @State private var hasFullDiskAccess = !RecentsStoreProbe.needsFullDiskAccess
+    @State private var hasTrackpad = TrackpadGestureWatcher.isAvailable
 
     var body: some View {
         ScrollView {
@@ -95,7 +105,7 @@ struct SettingsView: View {
 
                     toggle(
                         "Trackpad gesture",
-                        subtitle: TrackpadGestureWatcher.isAvailable
+                        subtitle: hasTrackpad
                             ? "Tap the trackpad to open or close the deck. A tap, not a "
                             + "swipe: swipes already mean pages and spaces, and this "
                             + "leaves every one of them alone."
@@ -103,9 +113,9 @@ struct SettingsView: View {
                         get: { prefs.trackpadGesture },
                         set: { prefs.trackpadGesture = $0 }
                     )
-                    .disabled(!TrackpadGestureWatcher.isAvailable)
+                    .disabled(!hasTrackpad)
 
-                    if TrackpadGestureWatcher.isAvailable {
+                    if hasTrackpad {
                         // A menu rather than a segmented control: five options,
                         // each named in words long enough that segments would
                         // truncate them into initials.
@@ -390,7 +400,7 @@ struct SettingsView: View {
             }
             .padding(24)
         }
-        .onAppear { refreshPermissions() }
+        .onAppear { refreshEnvironment() }
         // The window is created once and cached, with `isReleasedWhenClosed`
         // false, so closing Settings only orders it out — the SwiftUI tree stays
         // alive and `onAppear` fires exactly once per app launch. Permissions
@@ -401,7 +411,7 @@ struct SettingsView: View {
         // Settings is precisely when this app becomes active again.
         .onReceive(
             NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
-        ) { _ in refreshPermissions() }
+        ) { _ in refreshEnvironment() }
     }
 
     // MARK: - Building blocks
@@ -481,7 +491,7 @@ struct SettingsView: View {
         return "\(available) available."
     }
 
-    /// Re-reads all three permissions into `@State`.
+    /// Re-reads everything the body needs but cannot afford to ask for itself.
     ///
     /// Screen Recording and Accessibility are cheap TCC lookups. Full Disk
     /// Access is not: `RecentsStoreProbe.needsFullDiskAccess` opens
@@ -491,12 +501,20 @@ struct SettingsView: View {
     /// view body meant paying that on every redraw, including every frame of a
     /// window resize.
     ///
-    /// Activation is the right trigger for all three: returning from System
-    /// Settings is exactly when any of them can have changed.
-    private func refreshPermissions() {
+    /// Whether there is a trackpad joins them for the same reason. It reads like
+    /// a pointer check and is not one: it enumerates multitouch devices through
+    /// a private framework, and the body asks three separate times — so leaving
+    /// it in there meant three framework calls per redraw, on every frame of a
+    /// window resize or a drag of the tint picker.
+    ///
+    /// Activation is the right trigger for all four: returning from System
+    /// Settings is exactly when a permission can have changed, and it is also
+    /// when someone who has just paired a Magic Trackpad comes back.
+    private func refreshEnvironment() {
         hasScreenRecording = AppWindowCapture.shared.hasPermission
         hasAccessibility = AppWindowCapture.shared.hasAccessibilityPermission
         hasFullDiskAccess = !RecentsStoreProbe.needsFullDiskAccess
+        hasTrackpad = TrackpadGestureWatcher.isAvailable
     }
 
     private func permissionRow(

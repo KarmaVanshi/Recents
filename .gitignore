@@ -6,12 +6,17 @@ Recents.app/
 # Xcode / SwiftPM per-user state
 **/xcuserdata/
 *.xcuserstate
+.swiftpm/
+
+# Editor state
+.vscode/
 
 # Generated knowledge graph (regenerate with /graphify)
 graphify-out/
 
 # macOS
 .DS_Store
+Icon?
 
 # Claude Code local machine state
 .claude/settings.local.json

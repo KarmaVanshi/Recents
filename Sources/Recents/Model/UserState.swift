@@ -154,7 +154,10 @@ final class UserState {
         // them can be — which is the conservative choice: it keeps old flicks
         // standing until the item is genuinely used again, rather than
         // resurrecting the whole list at once.
-        guard let legacy = try? JSONDecoder().decode(LegacyPayload.self, from: data) else { return }
+        guard let legacy = try? JSONDecoder().decode(LegacyPayload.self, from: data) else {
+            quarantineUnreadableFile()
+            return
+        }
         let flickedAt = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
             .contentModificationDate ?? Date()
         payload = Payload(
@@ -162,6 +165,27 @@ final class UserState {
             suppressed: legacy.suppressed.map { Suppression(path: $0, at: flickedAt) }
         )
         save()
+    }
+
+    /// Moves a `state.json` that decoded as neither shape out of the way.
+    ///
+    /// Reaching here means the file exists, holds something, and holds nothing
+    /// this build can read — while the payload in memory is still the empty one
+    /// this object starts with. Left where it is, the next pin or flick calls
+    /// `save()`, which writes that empty payload straight over it: every pin and
+    /// every flick the user ever made, gone, with nothing said at the time and
+    /// nothing left to recover from. The write is atomic, so this is a narrow
+    /// case rather than an impossible one — it takes damage under the file
+    /// system or another process editing the file, not an interrupted save.
+    ///
+    /// The bytes are kept rather than reported. There is nowhere good to report
+    /// it from: this runs inside `init`, long before there is a window to say it
+    /// in. A file sitting beside the live one is at least an answer to "where
+    /// did my pins go" rather than silence.
+    private func quarantineUnreadableFile() {
+        let quarantine = fileURL.appendingPathExtension("unreadable")
+        try? FileManager.default.removeItem(at: quarantine)
+        try? FileManager.default.moveItem(at: fileURL, to: quarantine)
     }
 
     private func save() {

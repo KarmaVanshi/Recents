@@ -16,6 +16,11 @@
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Rendered by Resources/AppIcon/RenderIcon.swift. No Dock tile to wear
+         it, but Finder, the Privacy & Security lists and the Settings window
+         all show it. -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>CFBundleVersion</key>

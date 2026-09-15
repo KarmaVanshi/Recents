@@ -30,15 +30,23 @@ final class MenuBarItem {
         }
     }
 
-    /// Left click summons the deck directly — the fast path. Right click opens
-    /// the menu, so the deck is never more than one click away.
+    /// Left click opens Settings. Right click opens the menu, which is where
+    /// everything else lives — the deck included.
     ///
-    /// The absence of an event means "summon", not "do nothing". This used to
-    /// `guard let event = NSApp.currentEvent else { return }`, and an activation
-    /// that arrives without a mouse event behind it — VoiceOver pressing the
-    /// item, or anything driving it through the accessibility API — silently did
-    /// nothing at all. Only the *secondary* gesture needs to inspect the event,
-    /// so that is the only thing the event is asked about.
+    /// The primary click used to summon the deck. It was moved because the deck
+    /// now has a trackpad shape of its own — see `SummonGesture` — and Settings
+    /// did not: reaching it meant a right click and then a menu item, which is
+    /// two clicks for the one thing in this app that is looked for by pointer
+    /// rather than by muscle memory. The deck is still a keystroke, a trackpad
+    /// tap, and "Show Recent Items" in the menu, so nothing about it got further
+    /// away than the click that was spent finding it.
+    ///
+    /// The absence of an event means the primary gesture, not "do nothing". This
+    /// used to `guard let event = NSApp.currentEvent else { return }`, and an
+    /// activation that arrives without a mouse event behind it — VoiceOver
+    /// pressing the item, or anything driving it through the accessibility API —
+    /// silently did nothing at all. Only the *secondary* gesture needs to inspect
+    /// the event, so that is the only thing the event is asked about.
     @objc private func buttonClicked() {
         let event = NSApp.currentEvent
         let isSecondaryClick = event?.type == .rightMouseUp
@@ -47,7 +55,7 @@ final class MenuBarItem {
         if isSecondaryClick {
             showMenu()
         } else {
-            controller.toggle()
+            openSettings()
         }
     }
 
@@ -68,8 +76,8 @@ final class MenuBarItem {
     private func showMenu() {
         let menu = makeMenu()
 
-        // Attaching, popping, then detaching keeps left-click free to summon
-        // the deck instead of always opening this menu.
+        // Attaching, popping, then detaching keeps the primary click free to
+        // open Settings instead of always opening this menu.
         statusItem.menu = menu
         presentedMenu = menu
         statusItem.button?.performClick(nil)
@@ -77,6 +85,21 @@ final class MenuBarItem {
         statusItem.menu = nil
     }
 
+    /// The menu, with every item that does something grouped together at the
+    /// top and everything that merely says something at the bottom.
+    ///
+    /// The order is the whole point of this arrangement. A disabled row cannot
+    /// take the highlight — that is AppKit's rule for every menu — so a run of
+    /// them sitting between two actions is a stretch of menu the pointer travels
+    /// through with nothing lighting up. Measured on the previous order, that
+    /// stretch was about a hundred points tall: leaving "Show Recent Items" the
+    /// highlight went out and did not come back until "Restore Forgotten Items",
+    /// which reads exactly like a menu that has stopped tracking the mouse.
+    ///
+    /// Actions first and contiguous, so travelling from the first to the last
+    /// never crosses a gap. The three informational rows go together at the
+    /// bottom, where the only thing below them is Quit — which is the one item
+    /// nobody should reach by accident anyway.
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()
 
@@ -86,21 +109,14 @@ final class MenuBarItem {
         open.target = self
         menu.addItem(open)
 
-        let shortcut = NSMenuItem(
-            title: "Shortcut: \(Preferences.shared.hotKeyDisplay)", action: nil, keyEquivalent: ""
+        // Directly under the deck, and deliberately far from Quit. It used to sit
+        // immediately above it, which put the app's most-used item and its most
+        // destructive one one row apart.
+        let settings = NSMenuItem(
+            title: "Settings…", action: #selector(openSettings), keyEquivalent: ","
         )
-        shortcut.isEnabled = false
-        menu.addItem(shortcut)
-
-        menu.addItem(.separator())
-
-        let apps = store.items.filter { $0.kind == .application }.count
-        let docs = store.items.count - apps
-        let count = NSMenuItem(
-            title: "\(apps) apps · \(docs) files", action: nil, keyEquivalent: ""
-        )
-        count.isEnabled = false
-        menu.addItem(count)
+        settings.target = self
+        menu.addItem(settings)
 
         if !AppWindowCapture.shared.hasPermission {
             let capture = NSMenuItem(
@@ -139,17 +155,37 @@ final class MenuBarItem {
 
         menu.addItem(.separator())
 
-        let settings = NSMenuItem(
-            title: "Settings…", action: #selector(openSettings), keyEquivalent: ","
-        )
-        settings.target = self
-        menu.addItem(settings)
+        // Everything below here is a label rather than a control: the two ways
+        // in that are not this menu, and what the deck currently holds.
+        for title in [
+            trackpadSummary,
+            "Shortcut: \(Preferences.shared.hotKeyDisplay)",
+            deckSummary,
+        ].compactMap({ $0 }) {
+            let note = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            menu.addItem(note)
+        }
+
+        menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit Recents", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
 
         return menu
+    }
+
+    /// The trackpad shape, when there is one to report.
+    private var trackpadSummary: String? {
+        guard Preferences.shared.trackpadGesture, TrackpadGestureWatcher.isAvailable
+        else { return nil }
+        return "Trackpad: \(Preferences.shared.summonGesture.title)"
+    }
+
+    private var deckSummary: String {
+        let apps = store.items.filter { $0.kind == .application }.count
+        return "\(apps) apps · \(store.items.count - apps) files"
     }
 
     @objc private func showDeck() { controller.show() }

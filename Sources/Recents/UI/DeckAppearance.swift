@@ -257,6 +257,30 @@ struct DeckPalette {
     }
 }
 
+extension DeckPalette: Equatable {
+
+    /// Compared on what the palette is derived *from*, never on the fills
+    /// derived from it: `raised` and `chip` are pure functions of `ground`, so
+    /// two palettes built from the same four inputs are the same palette.
+    ///
+    /// The conformance is load-bearing rather than tidy. `DeckView` rebuilds
+    /// this in `body` and pushes it into the environment, and `body` runs on
+    /// every event of a trackpad scrub — sixty to a hundred and twenty times a
+    /// second. Without `==` SwiftUI has no way to tell one rebuild from the
+    /// next: the palette holds `NSColor`s, `deckBlended` allocates a fresh one
+    /// each time, and freshly allocated objects are what an environment value is
+    /// compared by when it is not `Equatable`. Every view that reads the palette
+    /// — every card, every thumbnail, every piece of glass — was therefore
+    /// invalidated on every frame of a scrub, for a value that had not changed
+    /// since the window opened.
+    static func == (a: DeckPalette, b: DeckPalette) -> Bool {
+        a.appearance == b.appearance
+            && a.style == b.style
+            && a.tint == b.tint
+            && a.ground == b.ground
+    }
+}
+
 // MARK: - Applying a surface
 
 extension View {

@@ -1,7 +1,8 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// Proves that the status item's menu can be driven from the keyboard.
+/// Proves that the status item answers both of its clicks: the right one opens
+/// a menu that can be driven from the keyboard, and the left one opens Settings.
 ///
 /// Run: `Recents.app/Contents/MacOS/Recents --selftest-menu`
 ///
@@ -28,6 +29,10 @@ enum MenuSelfTest {
     private static var itemCount = 0
     private static var afterFirst: String?
     private static var afterSecond: String?
+    private static var settingsOpened = false
+    /// Every row, and whether the pointer can light it up. Captured while the
+    /// menu is open, because that is the only moment there is one to read.
+    private static var layout: [(title: String, selectable: Bool)] = []
 
     static func run() {
         _ = NSApplication.shared
@@ -57,13 +62,19 @@ enum MenuSelfTest {
         step(2.9) { press(kVK_DownArrow) }
         step(3.4) { afterSecond = highlight() }
         step(3.7) { press(kVK_Escape) }
-        step(4.3) { report() }
+        // Then the other click. Settings is a plain window rather than a tracked
+        // menu, so this half asks the simpler question — did the primary click
+        // reach its action — and it is worth asking because that click changed
+        // meaning: it used to summon the deck.
+        step(4.3) { primaryClick() }
+        step(5.0) { settingsOpened = SettingsWindowController.shared.isShowing }
+        step(5.3) { report() }
 
         NSApp.run()
     }
 
     /// Right-clicks the status item, which is the gesture that opens the menu —
-    /// a left click summons the deck instead.
+    /// a left click opens Settings instead.
     private static func openMenu() {
         guard let frame = item?.buttonFrame else {
             print("  ✗ The status item never appeared in the menu bar, so there is")
@@ -71,14 +82,25 @@ enum MenuSelfTest {
             exit(1)
         }
 
-        let point = CGPoint(x: frame.midX, y: frame.midY)
         print("  Status item       : \(Int(frame.width))×\(Int(frame.height)) "
             + "at (\(Int(frame.minX)), \(Int(frame.minY)))")
+        click(.right)
+    }
 
-        for type in [CGEventType.rightMouseDown, .rightMouseUp] {
+    /// Left-clicks the status item, which is what opens Settings.
+    private static func primaryClick() { click(.left) }
+
+    private static func click(_ button: CGMouseButton) {
+        guard let frame = item?.buttonFrame else { return }
+        let point = flipped(CGPoint(x: frame.midX, y: frame.midY))
+        let types: [CGEventType] = button == .right
+            ? [.rightMouseDown, .rightMouseUp]
+            : [.leftMouseDown, .leftMouseUp]
+
+        for type in types {
             CGEvent(
                 mouseEventSource: nil, mouseType: type,
-                mouseCursorPosition: flipped(point), mouseButton: .right
+                mouseCursorPosition: point, mouseButton: button
             )?.post(tap: .cghidEventTap)
             usleep(60_000)
         }
@@ -89,7 +111,33 @@ enum MenuSelfTest {
     private static func highlight() -> String? {
         guard let menu = item?.presentedMenu else { return nil }
         itemCount = menu.items.count
+        layout = menu.items.map {
+            ($0.isSeparatorItem ? "———" : $0.title, !$0.isSeparatorItem && $0.isEnabled)
+        }
         return menu.highlightedItem?.title
+    }
+
+    /// Whether the rows that do something run from the top without a gap.
+    ///
+    /// A disabled row cannot take the highlight, so a run of them between two
+    /// actions is a stretch the pointer crosses with nothing lit up — which is
+    /// indistinguishable, from the outside, from a menu that has stopped
+    /// tracking the mouse. Measured on the order this replaced, that stretch ran
+    /// about a hundred points: the highlight went out leaving "Show Recent
+    /// Items" and did not come back until "Restore Forgotten Items".
+    ///
+    /// Quit is the deliberate exception. It sits under the informational rows
+    /// precisely so that it is not next to anything anyone reaches for often.
+    private static func actionsAreContiguous() -> (ok: Bool, detail: String) {
+        var seenGap = false
+        for row in layout {
+            if !row.selectable { seenGap = true; continue }
+            if seenGap, row.title != "Quit Recents" {
+                return (false, "\"\(row.title)\" sits below a run of rows that "
+                    + "cannot be highlighted")
+            }
+        }
+        return (true, "")
     }
 
     private static func report() -> Never {
@@ -124,6 +172,25 @@ enum MenuSelfTest {
 
         print("  ✓ ↓ moves the highlight: \"\(afterFirst)\" → \"\(afterSecond)\".")
         print("    Disabled rows and separators are stepped over, as they should be.")
+
+        guard settingsOpened else {
+            print("")
+            print("  ✗ A left click on the status item did not open Settings, so the")
+            print("    one-click route to it is not actually connected.")
+            exit(1)
+        }
+        print("  ✓ A left click opens Settings — one click, not a menu and a pick.")
+
+        let contiguity = actionsAreContiguous()
+        guard contiguity.ok else {
+            print("")
+            print("  ✗ The menu's actions are not contiguous: \(contiguity.detail).")
+            print("    The highlight goes out while the pointer crosses the gap,")
+            print("    which reads as the menu losing track of the mouse.")
+            exit(1)
+        }
+        print("  ✓ Every action runs from the top with no unhighlightable row")
+        print("    between them, so the highlight never goes out mid-travel.")
         exit(0)
     }
 

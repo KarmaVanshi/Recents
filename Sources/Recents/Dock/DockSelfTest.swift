@@ -180,6 +180,43 @@ enum DockSelfTest {
             print("  \("".padded(to: 4))live: \(mark(slot.isLive).padded(to: 6))"
                 + "\(size.padded(to: 20))\(window.title ?? "—")")
         }
+
+        // The same windows on a return visit. Leaving a tile releases its
+        // windows and keeps their frames; leaving the *next* tile drops them —
+        // see `clearWindowDemands` — and a panel coming back to the first tile
+        // has to fill in again from fresh captures. It could not: the dropped
+        // frame's hash was kept, so a static window's next capture was thrown
+        // away as unchanged, and a minimised document sat behind a placeholder
+        // for as long as it stayed minimised.
+        engine.clearWindowDemands()  // leaving this tile
+        engine.clearWindowDemands()  // leaving the next one
+        for window in target.windows {
+            engine.setDemand(.focused, forWindow: window.id)
+        }
+        engine.prime(target.windows.map { .window($0.id) })
+
+        let returnDeadline = Date().addingTimeInterval(1.5)
+        while Date() < returnDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+
+        var missingOnReturn = 0
+        for window in target.windows {
+            let slot = engine.slot(forWindow: window.id)
+            let size = slot.image.map { "\(Int($0.size.width))×\(Int($0.size.height)) pt" }
+                ?? "no image"
+            if slot.image == nil { missingOnReturn += 1 }
+            print("  \("".padded(to: 4))back: \(mark(slot.image != nil).padded(to: 6))"
+                + "\(size.padded(to: 20))\(window.title ?? "—")")
+        }
+        if missingOnReturn > 0 {
+            print("")
+            print("  ✗ \(missingOnReturn) window(s) got no frame on a return visit: the")
+            print("    engine is refusing their captures as unchanged after dropping")
+            print("    the frame they were compared against.")
+            exit(1)
+        }
+
         engine.clearWindowDemands()
         engine.release(.dock)
 

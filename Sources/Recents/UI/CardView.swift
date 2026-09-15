@@ -306,7 +306,7 @@ struct CardView: View {
     private var appIcon: some View {
         Group {
             if let app = item.owningApp {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+                Image(nsImage: DeckIcon.forFile(app.path))
                     .resizable()
                     .frame(width: metrics.badgeSize, height: metrics.badgeSize)
             }
@@ -439,8 +439,6 @@ private struct ServerImage: View {
     let item: RecentItem
     let size: CGSize
 
-    @Environment(\.deckPalette) private var palette
-
     var body: some View {
         ZStack {
             DeckSurfaceLayer(.card, in: Rectangle())
@@ -496,8 +494,6 @@ private struct AppWindowImage: View {
     let showsAge: Bool
     /// How much refresh this card should be getting, or nil for none.
     let attention: LiveWindowPreview.Demand?
-
-    @Environment(\.deckPalette) private var palette
 
     /// The engine's slot for this app. Held rather than looked up in `body`,
     /// because vending a slot inserts it into the engine's table and mutating
@@ -662,7 +658,7 @@ private struct AppWindowImage: View {
                 colors: [Color.primary.opacity(0.04), Color.primary.opacity(0.10)],
                 startPoint: .top, endPoint: .bottom
             )
-            Image(nsImage: NSWorkspace.shared.icon(forFile: item.url.path))
+            Image(nsImage: DeckIcon.forFile(item.url.path))
                 .resizable()
                 .interpolation(.high)
                 .aspectRatio(contentMode: .fit)

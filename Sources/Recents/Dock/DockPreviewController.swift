@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// The panel a Dock preview lives in.
@@ -17,14 +18,76 @@ final class DockPreviewPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// Hosting view that answers the first click.
+/// Hosting view that answers the first click, and reports where the pointer is.
 ///
 /// A window that is not key normally swallows the click that would have made it
 /// key, so the user has to click a thumbnail twice: once to focus a panel that
 /// refuses focus, and once for the thumbnail. Since this panel never becomes
 /// key, that first click has nothing to do but be delivered.
+///
+/// The pointer is tracked here, in AppKit, rather than with SwiftUI's `onHover`
+/// on each thumbnail. In a window that can never become key, SwiftUI's hover
+/// fires when the pointer enters the panel and then ignores every mouse-moved
+/// event after it — this view was measured receiving all of them while the
+/// highlight stayed on the first thumbnail the pointer had crossed. A tracking
+/// area of our own is delivered to regardless of key or active status, and the
+/// controller turns each position into a thumbnail through the same layout
+/// that placed them. See `DockPreviewLayout.thumbnailIndex(at:)`.
 private final class DockPreviewHostingView<Content: View>: NSHostingView<Content> {
+
+    /// Where the pointer is over this view, measured down and right from its
+    /// top-left corner, or nil once it has left.
+    var onPointer: ((CGPoint?) -> Void)?
+
+    private var pointerArea: NSTrackingArea?
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let pointerArea { removeTrackingArea(pointerArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil
+        )
+        addTrackingArea(area)
+        pointerArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        onPointer?(location(of: event))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        onPointer?(location(of: event))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onPointer?(nil)
+    }
+
+    /// Where the pointer is right now, in the same coordinates, or nil when it
+    /// is not over this view. For the moment a row is installed under a
+    /// pointer that is already resting on it: AppKit does not promise an
+    /// enter for a tracking area created under a stationary cursor.
+    var pointerLocation: CGPoint? {
+        guard let window else { return nil }
+        let point = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        guard bounds.contains(point) else { return nil }
+        return topLeft(point)
+    }
+
+    private func location(of event: NSEvent) -> CGPoint {
+        topLeft(convert(event.locationInWindow, from: nil))
+    }
+
+    private func topLeft(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
+    }
 }
 
 /// Shows a live preview of an application's windows while the pointer rests on
@@ -36,11 +99,11 @@ private final class DockPreviewHostingView<Content: View>: NSHostingView<Content
 /// only state it keeps is which tile it is currently showing.
 ///
 /// Dismissal is the part that needs care, and it is deliberately not driven by
-/// mouse events alone. A global event monitor stops reporting the moment the
-/// pointer crosses into one of this app's own windows — so the panel would never
-/// hear that the pointer had entered it, and, having heard nothing, would never
-/// hear it leave either. A slow poll while the panel is on screen answers both,
-/// and costs nothing the rest of the time because it does not run.
+/// mouse events alone. A pointer that has come to rest sends no more of them,
+/// and "the pointer has been off the tile and the panel for a while" is a fact
+/// about where it is resting, not about where it last moved. A slow poll while
+/// the panel is on screen answers that, and costs nothing the rest of the time
+/// because it does not run.
 @MainActor
 final class DockPreviewController {
 
@@ -62,6 +125,16 @@ final class DockPreviewController {
 
     /// The highlighted thumbnail, shared by the pointer and the arrow keys.
     private let selection = DockPreviewSelection()
+
+    /// The thumbnail the pointer was last resolved to, or nil when it is over
+    /// none — the header, a gap, the padding, or off the panel.
+    ///
+    /// Kept so the pointer only speaks when *that* changes. Every mouse-moved
+    /// event resolves to a thumbnail or to nothing, and acting on each one
+    /// would have a pointer resting on the panel's margin clear the highlight
+    /// the arrow keys had just put down, on every point of jitter — which is
+    /// exactly what `DockKeySelfTest` does while it presses them.
+    private var pointerIndex: Int?
 
     /// How the row on screen was sized. Built here and handed to the view, so
     /// the panel's geometry has one definition — which is what lets
@@ -153,6 +226,65 @@ final class DockPreviewController {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.hide() }
         }
+
+        // Once launch is out of the way rather than in its path.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.warmUp() }
+        }
+    }
+
+    /// Builds the panel and one throwaway row before the first hover asks for
+    /// them.
+    ///
+    /// The first `show` of a session was measured at ~85 ms against ~7 ms for
+    /// every one after it: creating the panel and its material, and SwiftUI
+    /// standing up its first hosting view, fonts and glass surfaces. Paid here,
+    /// in idle time just after launch, it is invisible; paid on the first hover
+    /// it was the one preview that visibly took longer than the rest. Nothing is
+    /// ordered on screen and nothing is subscribed to the feed — the row is a
+    /// single blank still, built, measured and thrown away.
+    private func warmUp() {
+        guard isStarted, panel == nil else { return }
+        let panel = makePanel()
+        self.panel = panel
+        applyAppearance()
+
+        let still = AppWindowCapture.Capture(
+            image: NSImage(size: NSSize(width: 16, height: 10)),
+            capturedAt: .distantPast, windowTitle: nil,
+            sourceSize: CGSize(width: 16, height: 10),
+            pixelSize: CGSize(width: 16, height: 10),
+            documentURL: nil
+        )
+        let target = DockWindows.Target(
+            name: "", bundleID: "", applicationURL: nil,
+            windows: [], totalWindows: 0, still: still, document: nil
+        )
+        let layout = DockPreviewLayout(
+            sourceSizes: DockPreviewView.sourceSizes(for: target), availableWidth: 1280
+        )
+        let hosting = DockPreviewHostingView(rootView: DockPreviewView(
+            target: target, slots: [:], selection: DockPreviewSelection(),
+            layout: layout, icon: nil,
+            onActivate: { _ in false }, onClose: { _ in false }, onZoom: { _ in false },
+            onOpen: { false }
+        ))
+        let size = hosting.fittingSize
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        install(hosting)
+        // Drawn once, off any screen, so the window's backing store exists
+        // before the first placement asks for it.
+        panel.setFrame(NSRect(origin: NSPoint(x: -10_000, y: -10_000), size: size), display: true)
+        hosting.removeFromSuperview()
+
+        // The first event tap of a session is the expensive one — measured at
+        // 16 ms against nothing for every one after it. Binding the capture
+        // SPI and the first walk of the window list are cold once each, too.
+        keys.start()
+        keys.stop()
+        _ = WindowServerCapture.isAvailable
+        _ = WindowServerCapture.candidateWindows()
+        LiveWindowPreview.shared.warmUp()
     }
 
     func stop() {
@@ -216,6 +348,17 @@ final class DockPreviewController {
     /// the arrow keys move and what Return acts on, and `DockKeySelfTest` has no
     /// other way to ask whether a keystroke arrived.
     var selectedIndex: Int? { selection.index }
+
+    /// Every change to the highlight, as it happens.
+    ///
+    /// For `DockSweepSelfTest`, which measures how far the highlight runs
+    /// behind a pointer sweeping the row: the instant `select` writes the index
+    /// is one end of that measurement, and nothing polled from outside could
+    /// place it — a poll on the main thread is delayed by the very stalls being
+    /// measured.
+    var selectionChanges: AnyPublisher<Int?, Never> {
+        selection.$index.dropFirst().eraseToAnyPublisher()
+    }
 
     /// Puts a preview on screen as though its tile had been hovered, and leaves
     /// it there.
@@ -320,11 +463,12 @@ final class DockPreviewController {
             icon: DockPreviewView.icon(for: target),
             onActivate: { [weak self] window in
                 MainActor.assumeIsolated {
-                    // The panel stays up when the window could not be reached,
-                    // so the thumbnail can say so. Dismissing on a failed
-                    // activation would leave the user looking at an app that
-                    // came forward showing something else entirely.
-                    guard DockWindows.activate(window: window).isSuccess else {
+                    // A window that cannot be reached through Accessibility
+                    // falls back to asking its application to open one — see
+                    // `DockWindows.activateOrOpen`. Either way the click led
+                    // somewhere, so the panel goes; the thumbnail's badge is now
+                    // only for the tile that has no application to ask.
+                    guard DockWindows.activateOrOpen(window: window, of: target) else {
                         return false
                     }
                     self?.hide()
@@ -372,16 +516,17 @@ final class DockPreviewController {
             },
             onOpen: { [weak self] in
                 MainActor.assumeIsolated {
-                    DockWindows.open(target)
+                    guard DockWindows.open(target) else { return false }
                     self?.hide()
+                    return true
                 }
-            },
-            onHover: { [weak self] index, isInside in
-                MainActor.assumeIsolated { self?.pointerMoved(to: index, isInside: isInside) }
             }
         )
 
         let hosting = DockPreviewHostingView(rootView: root)
+        hosting.onPointer = { [weak self] point in
+            MainActor.assumeIsolated { self?.pointer(at: point) }
+        }
 
         // Ask the built hierarchy how big it wants to be rather than computing
         // it here in parallel. Every dimension in the row is fixed at build time
@@ -409,7 +554,17 @@ final class DockPreviewController {
 
         shownTile = tile
         awaySince = nil
+        // From here the pointer is browsing between tiles, and the watcher
+        // reports the next one at once, with no dwell.
+        DockHoverWatcher.shared.isShowingPreview = true
         place(panel, for: tile, size: size)
+
+        // A row installed under a pointer already resting on it — the panel
+        // re-forming after a close — highlights what is under the pointer at
+        // once rather than waiting for a move. Only when the pointer is over a
+        // thumbnail: elsewhere the kept selection stands.
+        pointerIndex = hosting.pointerLocation.flatMap { layout.thumbnailIndex(at: $0) }
+        if let pointerIndex { select(pointerIndex) }
 
         // Frames first, panel second: a preview that appears and then fills in a
         // frame at a time reads as slower than one that appears complete, even
@@ -420,8 +575,11 @@ final class DockPreviewController {
         if !panel.isVisible {
             panel.alphaValue = 0
             panel.orderFrontRegardless()
+            // Long enough not to pop, short enough not to be waited for: it
+            // sits on top of the dwell, and the two together are what the user
+            // reads as how quickly the preview answers.
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.12
+                context.duration = 0.08
                 panel.animator().alphaValue = 1
             }
         }
@@ -528,17 +686,22 @@ final class DockPreviewController {
         return shownTarget.still == nil ? 0 : 1
     }
 
-    /// The pointer entering or leaving a thumbnail.
+    /// The pointer moving over the panel, or leaving it.
     ///
-    /// Leaving only clears the highlight if it is still this thumbnail's. Moving
-    /// the pointer from one thumbnail to its neighbour delivers an enter and a
-    /// leave in an order SwiftUI does not promise, and clearing unconditionally
-    /// would take the highlight off the thumbnail the pointer had just arrived
-    /// on whenever the leave came second.
-    private func pointerMoved(to index: Int, isInside: Bool) {
-        if isInside {
+    /// Every position is resolved against the row's layout, so there are no
+    /// enter-and-leave pairs to put in order: arriving on a thumbnail chooses
+    /// it, and leaving one for nothing — a gap, the header, off the panel —
+    /// clears the highlight only if it is still that thumbnail's. A pointer
+    /// that was never on a thumbnail changes nothing, so the arrow keys can be
+    /// used with the pointer parked anywhere on the panel.
+    private func pointer(at point: CGPoint?) {
+        let index = point.flatMap { shownLayout?.thumbnailIndex(at: $0) }
+        guard index != pointerIndex else { return }
+        let previous = pointerIndex
+        pointerIndex = index
+        if let index {
             select(index)
-        } else if selection.index == index {
+        } else if selection.index == previous {
             select(nil)
         }
     }
@@ -602,11 +765,14 @@ final class DockPreviewController {
 
         if shownTarget.windows.indices.contains(index) {
             // The key was aimed at this panel either way, so it is consumed
-            // either way — but a window that could not be reached leaves the
-            // preview up rather than dismissing it over a raise that did not
-            // happen. See the note on `DockWindows.activate`.
-            guard DockWindows.activate(window: shownTarget.windows[index]).isSuccess
-            else { return true }
+            // either way — but a window that could not be reached, and whose app
+            // could not be asked for one either, leaves the preview up rather
+            // than dismissing it over nothing having happened. Return does
+            // exactly what a click does, fallback included. See
+            // `DockWindows.activateOrOpen`.
+            guard DockWindows.activateOrOpen(
+                window: shownTarget.windows[index], of: shownTarget
+            ) else { return true }
         } else if shownTarget.still != nil {
             DockWindows.open(shownTarget)
         } else {
@@ -619,7 +785,15 @@ final class DockPreviewController {
     /// Returns whether the key was used — which is what decides whether the
     /// application in front still gets it. See `DockPreviewKeys`.
     private func handle(_ key: DockPreviewKeys.Key) -> Bool {
-        guard panel?.isVisible == true else { return false }
+        guard let panel, panel.isVisible else { return false }
+
+        // Not merely "a panel is up". See `DockPreviewSelection.panelOwnsKeyboard`:
+        // every key this answers is a key taken away from the application in
+        // front, and a preview that appears from resting the pointer near the
+        // Dock has been given no reason to think those keys were meant for it.
+        guard DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel.frame, pointer: NSEvent.mouseLocation
+        ) else { return false }
 
         switch key {
         case .previous: return step(-1)
@@ -787,6 +961,8 @@ final class DockPreviewController {
         shownTarget = nil
         shownLayout = nil
         selection.index = nil
+        pointerIndex = nil
+        DockHoverWatcher.shared.isShowingPreview = false
 
         let engine = LiveWindowPreview.shared
         engine.cancelPriming()

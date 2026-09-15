@@ -69,7 +69,7 @@ struct PeekView: View {
     private var header: some View {
         HStack(spacing: 10) {
             if let app = item.owningApp {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+                Image(nsImage: DeckIcon.forFile(app.path))
                     .resizable().frame(width: 22, height: 22)
             }
 
@@ -213,7 +213,7 @@ struct PeekView: View {
             ZStack {
                 Color(nsColor: .controlBackgroundColor).opacity(0.6)
                 VStack(spacing: 14) {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: item.url.path))
+                    Image(nsImage: DeckIcon.forFile(item.url.path))
                         .resizable().frame(width: 128, height: 128)
                     Text("No window captured yet")
                         .font(.system(size: 12, weight: .medium))

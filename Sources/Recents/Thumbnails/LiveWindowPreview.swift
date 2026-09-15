@@ -96,6 +96,22 @@ final class LiveWindowPreview {
         var isOffScreen = false
 
         @ObservationIgnored fileprivate var frameHash: UInt64 = 0
+
+        /// Lets the frame go, and with it the memory of which frame it was.
+        ///
+        /// The two have to go together. A capture whose hash matches
+        /// `frameHash` is dropped on the capture queue as "unchanged" before
+        /// anything on the main actor sees it — which is right while the frame
+        /// it matches is still in `image`, and wrong from the moment that frame
+        /// has been released: the window has nothing new to say, so it is never
+        /// allowed to say anything again. A minimised document window is the
+        /// worst case, because nothing ever changes in it. Measured: hover a Dock
+        /// tile, hover two others, come back — every thumbnail a placeholder,
+        /// for as long as the windows stayed minimised.
+        fileprivate func dropFrame() {
+            image = nil
+            frameHash = 0
+        }
         @ObservationIgnored fileprivate var lastArrival: Date = .distantPast
         /// When this subject was last *asked* for a frame, which is a different
         /// question from when one last arrived — see `scheduledSubjects`.
@@ -166,6 +182,23 @@ final class LiveWindowPreview {
     private var windowMapRefreshedAt: Date = .distantPast
     private let windowMapLifetime: TimeInterval = 1
 
+    /// Every running application's bundle identifier, by process.
+    ///
+    /// Held rather than re-read on each window-map refresh, because reading it
+    /// is not the lookup it looks like. `NSWorkspace.runningApplications` hands
+    /// back objects whose properties are fetched lazily, and the first
+    /// `processIdentifier` or `bundleIdentifier` read on each is a LaunchServices
+    /// round trip. Walked once a second from `refreshWindowMap`, fifty
+    /// applications came to ~10 ms of the main thread — every second, for as
+    /// long as any preview was on screen, and visible as a regular hitch in
+    /// whatever the pointer was doing.
+    ///
+    /// Nil when the set of running applications has changed since it was last
+    /// built, which the workspace announces through KVO; rebuilt on the next
+    /// refresh that needs it.
+    private var bundleIDsByPID: [pid_t: String]?
+    private var runningApplicationsObserver: NSKeyValueObservation?
+
     private let queue = DispatchQueue(
         label: "com.recents.deck.livepreview", qos: .userInitiated
     )
@@ -207,7 +240,24 @@ final class LiveWindowPreview {
         }
     }
 
-    private init() {}
+    private init() {
+        // Hopped onto the main queue rather than assumed to be there: the
+        // workspace posts this from the main thread today, and the cost of
+        // being wrong about that would be a trap, not a stale map for a tick.
+        runningApplicationsObserver = NSWorkspace.shared.observe(
+            \.runningApplications, options: []
+        ) { _, _ in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { LiveWindowPreview.shared.bundleIDsByPID = nil }
+            }
+        }
+    }
+
+    /// Pays the engine's cold costs ahead of the first surface that needs it:
+    /// the process table and the window list, each a round trip the first time.
+    func warmUp() {
+        refreshWindowMap()
+    }
 
     /// Whether live previews can work at all: the private capture path has to be
     /// present.
@@ -278,7 +328,7 @@ final class LiveWindowPreview {
         stop()
         if !clients.isEmpty { start() }
         if !isEnabled {
-            for slot in slots.values { slot.image = nil }
+            for slot in slots.values { slot.dropFrame() }
         }
     }
 
@@ -330,10 +380,33 @@ final class LiveWindowPreview {
     func clearWindowDemands() {
         // `Array`: the loop body mutates the dictionary that `keys` is a live
         // view of.
+        var released: Set<Subject> = []
         for subject in Array(demands.keys) where isWindow(subject) {
             demands.removeValue(forKey: subject)
             slots[subject]?.isLive = false
             slots[subject]?.consecutiveFailures = 0
+            released.insert(subject)
+        }
+
+        // The frames just released are kept, and every older one is dropped.
+        //
+        // Keeping them is the deliberate part, and it is why the slots survive
+        // this at all: a panel re-forming around a closed window, or the pointer
+        // going back to the tile it just left, redraws complete instead of
+        // filling in a frame at a time. Keeping *every* frame ever captured is
+        // the part that was not intended. A frame is not merely bytes — see
+        // `forgetWindow` — it is the window's own backing store, and holding one
+        // keeps the window server's copy of that window alive behind it. Every
+        // window of every tile hovered in a session was being held that way for
+        // as long as Recents ran, which grows this process without bound and
+        // keeps other applications' closed windows resident along with it.
+        //
+        // One panel's worth is the bound, because one panel back is as far as
+        // "the tile I just left" ever reaches. Anything older is a picture of a
+        // window nothing on screen names.
+        for (subject, slot) in slots
+        where isWindow(subject) && !released.contains(subject) && demands[subject] == nil {
+            slot.dropFrame()
         }
     }
 
@@ -701,11 +774,19 @@ final class LiveWindowPreview {
         // set lookup per window per second.
         // One walk of the process table rather than a lookup per window: a busy
         // desktop has far more windows than applications, and every window
-        // needs the same question answered about its owner.
-        var bundleIDs: [pid_t: String] = [:]
-        for app in NSWorkspace.shared.runningApplications {
-            guard let bundleID = app.bundleIdentifier else { continue }
-            bundleIDs[app.processIdentifier] = bundleID
+        // needs the same question answered about its owner — and that walk
+        // only when the table has changed. See `bundleIDsByPID`.
+        let bundleIDs: [pid_t: String]
+        if let cached = bundleIDsByPID {
+            bundleIDs = cached
+        } else {
+            var built: [pid_t: String] = [:]
+            for app in NSWorkspace.shared.runningApplications {
+                guard let bundleID = app.bundleIdentifier else { continue }
+                built[app.processIdentifier] = bundleID
+            }
+            bundleIDsByPID = built
+            bundleIDs = built
         }
 
         let candidates = WindowServerCapture.candidateWindows().filter { window in

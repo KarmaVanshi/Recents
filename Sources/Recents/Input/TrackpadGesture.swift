@@ -106,7 +106,21 @@ enum MultitouchSupport {
     }()
 
     /// Whether the framework and every symbol this file needs are present.
-    static var isAvailable: Bool { bindings != nil }
+    /// Whether this Mac has a trackpad the app can actually read.
+    ///
+    /// The framework loading is not the question. `MultitouchSupport.framework`
+    /// is present on every Mac, desktops included, so `bindings != nil` answered
+    /// yes on hardware with no trackpad at all — and everything downstream
+    /// believed it. Settings offered the gesture with its switch live and its
+    /// shape dropdown showing; the status menu reported the chosen shape; and no
+    /// contact ever arrived, because there was no device to deliver one. The
+    /// "no trackpad the app can read" subtitle written for exactly this case
+    /// could never appear, because the condition it hangs on was never false.
+    ///
+    /// Asked fresh rather than resolved once: a Magic Trackpad can be paired
+    /// while the app is running, and both callers — the Settings body and the
+    /// status menu — are cold enough to afford the framework call.
+    static var isAvailable: Bool { bindings != nil && !deviceList().devices.isEmpty }
 
     /// The devices, together with the array that owns them.
     ///
@@ -160,6 +174,19 @@ struct TouchFrame {
     var timestamp: Double
     /// Empty when the contact layout failed validation — see `Touch`.
     var positions: [MultitouchSupport.Point]
+    /// Whether a mouse button was physically down when this frame was reported.
+    ///
+    /// Sampled per frame rather than observed as an event, because it has to be
+    /// answered on the contact thread and cannot wait on the main one — see
+    /// `TrackpadGestureWatcher.handle`. Defaulted, so the self-test and the
+    /// recogniser's own tests can build a frame without it.
+    var isClicking: Bool = false
+    /// Whether the system was delivering a finger-driven scroll around the time
+    /// this frame was reported.
+    ///
+    /// The one thing that separates a two-finger tap from the gesture two
+    /// fingers actually mean. See `TapRecognizer`.
+    var isScrolling: Bool = false
 }
 
 /// Recognises "N fingers tapped, together, without travelling".
@@ -176,11 +203,32 @@ struct TouchFrame {
 ///   • all of them must land close together in time, so resting a hand on the
 ///     trackpad and then adding a finger never counts;
 ///   • every finger must lift within `maxDuration`, because a swipe holds
-///     contact while it travels; and
-///   • no finger may travel more than `maxTravel` of the trackpad's width.
+///     contact while it travels;
+///   • no finger may travel more than `maxTravel` of the trackpad's width; and
+///   • no mouse button may go down while they are on the trackpad; and
+///   • the system may not be scrolling while they are on it.
 ///
 /// The travel test is the one that needs the contact layout to be right. Without
 /// it the other three still hold, and they are what does most of the work.
+///
+/// The click test is what makes a two-finger shape usable at all. A physical
+/// two-finger *click* is the secondary click on a stock Mac, and from the
+/// contacts alone it is indistinguishable from a two-finger tap: two fingers
+/// land, stay put, and lift. Without this, binding two fingers would summon the
+/// deck on every right click. Reading the button state instead of the contacts
+/// separates them exactly — a tap is a touch with no press in it — and the rule
+/// is applied at every finger count rather than only at two, because "clicking
+/// with three fingers down" was never meant to be this gesture either.
+///
+/// The scroll test is the other half of the same problem, and it is the one that
+/// was learned the expensive way. Two fingers on a trackpad are, overwhelmingly,
+/// a *scroll*, and the travel test does not catch a short one: a few lines of
+/// scrolling moves the centroid well under `maxTravel`. Bound to two fingers
+/// without this, the gesture fired every 0.2 to 0.9 seconds through ordinary
+/// reading — each fire toggling the deck, stealing activation, and tearing down
+/// whatever menu happened to be open. A scroll announces itself as scroll events
+/// long before the fingers lift, so an episode with one in it is a scroll and
+/// never a tap, whatever the contacts looked like.
 struct TapRecognizer {
 
     var fingerCount: Int
@@ -224,6 +272,10 @@ struct TapRecognizer {
     private var previous = 0
     private var completedTaps = 0
     private var lastTapEndedAt: Double = 0
+    /// Whether a mouse button went down at any point in the current episode.
+    private var wasClicked = false
+    /// Whether the system scrolled at any point in the current episode.
+    private var wasScrolled = false
 
     init(fingerCount: Int = 3, tapCount: Int = 1) {
         self.fingerCount = fingerCount
@@ -256,11 +308,19 @@ struct TapRecognizer {
                 peak = 0
                 origins = []
                 travelled = 0
+                wasClicked = false
+                wasScrolled = false
             }
             lastRiseAt = frame.timestamp
         }
 
         guard isTracking else { return .pending }
+
+        // Sticky for the whole episode: the press and the release both happen
+        // while the fingers are down, so a frame-by-frame answer would go back
+        // to false before they lift.
+        if frame.isClicking { wasClicked = true }
+        if frame.isScrolling { wasScrolled = true }
 
         peak = max(peak, frame.fingerCount)
 
@@ -283,6 +343,11 @@ struct TapRecognizer {
         // Not a rejection worth reporting: every ordinary click and scroll ends
         // here, and logging them buries the near-misses that are worth seeing.
         guard peak == fingerCount else { return .pending }
+        // Before the measurements, because neither of these is a near miss: the
+        // user clicked, or the user scrolled, and on two fingers those are what
+        // two fingers ordinarily mean.
+        if wasClicked { return .pending }
+        if wasScrolled { return .pending }
         if heldFor > maxDuration {
             return .rejected(String(format: "held %.2fs, limit %.2fs", heldFor, maxDuration))
         }
@@ -335,27 +400,45 @@ struct TapRecognizer {
 /// those would be worse than no summon at all. A flat tap travels nowhere, so it
 /// collides with nothing that does.
 ///
-/// Two fingers are missing from the list on purpose rather than by oversight:
-/// a two-finger tap is the secondary click and a two-finger double tap is smart
-/// zoom (`TrackpadTwoFingerDoubleTapGesture`, on by default), so both are spoken
-/// for on a stock Mac. Offering them would be offering a gesture that fires
-/// every time the user tries to right-click.
+/// Two fingers are the shape that needs the most care, and they used to be left
+/// out of this list altogether for it. Three things claim two fingers on a stock
+/// Mac: the secondary *click* (`TrackpadRightClick`, on by default), the
+/// secondary *tap* when tap-to-click is switched on (`Clicking`), and smart zoom
+/// on a two-finger *double* tap (`TrackpadTwoFingerDoubleTapGesture`).
+///
+/// A single two-finger tap avoids the third outright, and `TapRecognizer` now
+/// tells a tap apart from a click by reading the button state — see the note
+/// there — which is what takes the first out of the way. That leaves the second,
+/// which is a setting rather than a fact: with tap-to-click off, which is how
+/// macOS ships, a two-finger tap is genuinely unbound. `systemConflict` says so
+/// when it is not.
+///
+/// A two-finger *double* tap is still absent, and that one is not recoverable:
+/// smart zoom is on by default and is the same shape exactly.
 enum SummonGesture: String, CaseIterable, Identifiable, Sendable {
+    case twoFingerTap
     case threeFingerTap
     case fourFingerTap
     case fiveFingerTap
     case threeFingerDoubleTap
     case fourFingerDoubleTap
 
-    /// Three fingers, tapped once — measured rather than chosen. In a 2629-frame
-    /// trial it recognised eight deliberate taps and fired zero times across
-    /// roughly forty three-finger swipes.
-    static let `default` = SummonGesture.threeFingerTap
+    /// Two fingers, tapped once: the shortest reach on the trackpad, and free of
+    /// every system gesture once a tap is told apart from a click — which is what
+    /// `TapRecognizer` now does, and what this could not be the default without.
+    ///
+    /// Three fingers held this place before, on measurement rather than taste: in
+    /// a 2629-frame trial a three-finger tap recognised eight deliberate taps and
+    /// fired zero times across roughly forty three-finger swipes. It is still the
+    /// shape to move to if two ever proves too easy to fire by accident, and it
+    /// is one line away in Settings.
+    static let `default` = SummonGesture.twoFingerTap
 
     var id: String { rawValue }
 
     var fingerCount: Int {
         switch self {
+        case .twoFingerTap: 2
         case .threeFingerTap, .threeFingerDoubleTap: 3
         case .fourFingerTap, .fourFingerDoubleTap: 4
         case .fiveFingerTap: 5
@@ -382,6 +465,11 @@ enum SummonGesture: String, CaseIterable, Identifiable, Sendable {
     /// One line on what this shape is like to live with.
     var summary: String {
         switch self {
+        case .twoFingerTap:
+            return "The quickest shape there is, and a tap rather than a click — "
+                 + "clicking with two fingers stays the secondary click and never "
+                 + "summons this. It needs “Tap to click” left off, which is how "
+                 + "macOS ships; this says so when it has been switched on."
         case .threeFingerTap:
             return "The easiest to reach, and unclaimed on a stock Mac. Switching "
                  + "on Look Up by three-finger tap, or three-finger drag, is what "
@@ -403,9 +491,27 @@ enum SummonGesture: String, CaseIterable, Identifiable, Sendable {
     }
 
     /// A fresh recogniser for this shape.
+    ///
+    /// Two fingers are held to a shorter window than the rest. `maxDuration` is
+    /// generous — 1.8s — because at three fingers and up the only thing it has
+    /// to exclude is a hand resting on the trackpad, which is a deliberate act
+    /// and runs longer still. Two fingers rest on a trackpad constantly and for
+    /// no reason at all, so the same window admits every one of them. A tap that
+    /// is over inside `twoFingerMaxDuration` is a tap; two fingers sitting there
+    /// for longer than that are just two fingers sitting there.
     var recognizer: TapRecognizer {
-        TapRecognizer(fingerCount: fingerCount, tapCount: tapCount)
+        var recognizer = TapRecognizer(fingerCount: fingerCount, tapCount: tapCount)
+        if fingerCount == 2 { recognizer.maxDuration = Self.twoFingerMaxDuration }
+        return recognizer
     }
+
+    /// Provisional, and the one number here that is not yet measured: the
+    /// three-finger window came out of a 2629-frame trial, and this has had no
+    /// equivalent. Deliberate two-finger taps observed so far land well inside
+    /// it. If it turns out to reject real taps, the log at
+    /// `~/Library/Logs/Recents-trackpad.log` says so in as many words —
+    /// "rejected: held …s, limit …s" — which is what it is there for.
+    static let twoFingerMaxDuration: Double = 0.6
 
     /// What this Mac is *currently* doing with the same shape, if anything.
     ///
@@ -415,6 +521,11 @@ enum SummonGesture: String, CaseIterable, Identifiable, Sendable {
     /// something on themselves, and telling them that beats letting them
     /// discover it as a bug in this app.
     var systemConflict: String? {
+        if fingerCount == 2, TrackpadSystemSettings.tapToClickIsOn {
+            return "“Tap to click” is on, which makes a two-finger tap the "
+                 + "secondary click — so this shape will open context menus too. "
+                 + "Turn it off in Trackpad settings, or choose another shape."
+        }
         guard fingerCount == 3 else { return nil }
         if TrackpadSystemSettings.threeFingerTapOpensLookUp {
             return "System Settings has “Look up & data detectors” set to a "
@@ -448,6 +559,13 @@ enum TrackpadSystemSettings {
         domains
             .compactMap { UserDefaults(suiteName: $0)?.object(forKey: key) as? Int }
             .max()
+    }
+
+    /// Tap-to-click. With it on, a light two-finger tap *is* the secondary
+    /// click, and no amount of reading the button state can separate them —
+    /// there is no button press to read. macOS ships with this off.
+    static var tapToClickIsOn: Bool {
+        (setting("Clicking") ?? 0) != 0
     }
 
     /// Look Up bound to a three-finger tap instead of a force click.
@@ -486,6 +604,28 @@ final class TrackpadGestureWatcher: @unchecked Sendable {
     private var storedOnGesture: (() -> Void)?
     private var storedOnFrame: ((TouchFrame) -> Void)?
     private var storedLayoutLooksWrong = false
+    /// When a finger-driven scroll last arrived. Written from the main thread by
+    /// the event monitors, read on the contact thread — so, like everything else
+    /// here, through the lock.
+    private var storedLastScrollAt: Date = .distantPast
+    private var scrollMonitors: [Any] = []
+    /// Whether the first scroll of this run has been noted in the log.
+    ///
+    /// One line, once, and it earns its place: if the scroll monitors ever fail
+    /// to install, the gesture goes straight back to reading every scroll as a
+    /// tap — and that failure is invisible from outside, because a misfiring
+    /// gesture and a working one look identical until the deck starts appearing
+    /// on its own. This is the line that says the guard is live.
+    private var storedLoggedFirstScroll = false
+
+    /// How long after a scroll event the trackpad still counts as scrolling.
+    ///
+    /// A window rather than an exact answer, because scroll events arrive on the
+    /// main run loop and the contacts arrive on their own thread; the two cannot
+    /// be lined up precisely and do not need to be. Long enough to cover the gap
+    /// between one scroll event and the next, short enough that a deliberate tap
+    /// straight after a scroll is still read as a tap.
+    private static let scrollMemory: TimeInterval = 0.3
 
     var recognizer: TapRecognizer {
         get { lock.lock(); defer { lock.unlock() }; return storedRecognizer }
@@ -548,6 +688,8 @@ final class TrackpadGestureWatcher: @unchecked Sendable {
             MultitouchSupport.register(device, Self.trampoline)
             MultitouchSupport.start(device)
         }
+        storedLoggedFirstScroll = false
+        installScrollMonitors()
         isRunning = !deviceList.devices.isEmpty
         Self.log.write("watcher started: \(self.deviceList.devices.count) device(s), watching \(self.storedRecognizer.fingerCount) fingers x\(self.storedRecognizer.tapCount)")
         return deviceList.devices.count
@@ -562,6 +704,66 @@ final class TrackpadGestureWatcher: @unchecked Sendable {
         }
         deviceList = .empty
         isRunning = false
+        scrollMonitors.forEach(NSEvent.removeMonitor)
+        scrollMonitors.removeAll()
+    }
+
+    /// Notes when the system is scrolling, so the recogniser can refuse to read
+    /// a scroll as a tap.
+    ///
+    /// Both monitors: a global one sees scrolls aimed at every other
+    /// application, which is where they nearly always go, and a local one covers
+    /// the deck's own window — a global monitor is blind to its own process.
+    ///
+    /// Momentum is deliberately not counted. It carries on for a second or more
+    /// after the fingers have left the trackpad, and treating it as scrolling
+    /// would make the gesture unreachable for exactly as long as a flick keeps
+    /// coasting.
+    private func installScrollMonitors() {
+        // Idempotent, because `start()` is not. `start()` returns early only
+        // once `isRunning` has latched, and `isRunning` stays false when the
+        // device list came back empty — so on a Mac with no trackpad every call
+        // reached this and appended another pair, while the pair before it was
+        // never removed and went on running the handler for every scroll.
+        guard scrollMonitors.isEmpty else { return }
+
+        let note: (NSEvent) -> Void = { event in
+            guard event.momentumPhase == [] else { return }
+            let watcher = TrackpadGestureWatcher.shared
+            watcher.lock.lock()
+            watcher.storedLastScrollAt = Date()
+            let isFirst = !watcher.storedLoggedFirstScroll
+            watcher.storedLoggedFirstScroll = true
+            watcher.lock.unlock()
+            if isFirst {
+                Self.log.write("scroll guard live — scrolls will not be read as taps")
+            }
+        }
+
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel, handler: note) {
+            scrollMonitors.append(global)
+        }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel, handler: {
+            note($0)
+            return $0
+        }) {
+            scrollMonitors.append(local)
+        }
+    }
+
+    /// Whether any mouse button is physically down right now.
+    ///
+    /// `CGEventSource` rather than `NSEvent.pressedMouseButtons`, because this is
+    /// read on the framework's own contact thread and AppKit is not to be touched
+    /// from there. Sampled per frame rather than watched as an event for the same
+    /// reason: an `NSEvent` monitor is delivered on the main run loop, and a busy
+    /// main thread would let the answer arrive after the fingers had already
+    /// lifted — which is the one moment it has to be right. Measured at 0.01µs a
+    /// call, against frames that arrive around a hundred times a second.
+    private static func anyMouseButtonIsDown() -> Bool {
+        CGEventSource.buttonState(.combinedSessionState, button: .left)
+            || CGEventSource.buttonState(.combinedSessionState, button: .right)
+            || CGEventSource.buttonState(.combinedSessionState, button: .center)
     }
 
     /// A C function pointer cannot capture context, so the callback routes
@@ -599,8 +801,9 @@ final class TrackpadGestureWatcher: @unchecked Sendable {
             }
         }
 
-        let frame = TouchFrame(
-            fingerCount: count, timestamp: timestamp, positions: positions
+        var frame = TouchFrame(
+            fingerCount: count, timestamp: timestamp, positions: positions,
+            isClicking: Self.anyMouseButtonIsDown()
         )
 
         // Everything the lock guards, read and written in one pass — including
@@ -609,6 +812,8 @@ final class TrackpadGestureWatcher: @unchecked Sendable {
         // handler deadlocks, and `NSLock` is not recursive.
         lock.lock()
         if layoutLooksWrong { storedLayoutLooksWrong = true }
+        frame.isScrolling =
+            Date().timeIntervalSince(storedLastScrollAt) < Self.scrollMemory
         let onFrame = storedOnFrame
         let onGesture = storedOnGesture
         let outcome = storedRecognizer.accept(frame)

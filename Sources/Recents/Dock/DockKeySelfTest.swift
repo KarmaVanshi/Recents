@@ -89,25 +89,55 @@ enum DockKeySelfTest {
         // takes the first thumbnail, → again steps along, ← steps back, and ←
         // at the first thumbnail stays put rather than wrapping round to the
         // last.
-        record(at: 0.6, key: "→", kVK_RightArrow, expected: 0)
-        record(at: 1.1, key: "→", kVK_RightArrow, expected: min(1, count - 1))
-        record(at: 1.6, key: "←", kVK_LeftArrow, expected: 0)
-        record(at: 2.1, key: "←", kVK_LeftArrow, expected: 0)
+        // The pointer goes onto the panel before a key is pressed, because that
+        // is now what decides whether these keys are the panel's at all — see
+        // `DockPreviewSelection.panelOwnsKeyboard`. Onto the panel's own margin
+        // rather than onto a thumbnail: hovering a picture would highlight it,
+        // and the first expectation below is about → starting from nothing.
+        let restore = NSEvent.mouseLocation
+
+        // Re-asserted before every keystroke rather than once at the start. The
+        // panel is placed as the run loop turns, so a single move scheduled
+        // against the clock can land before there is a panel to land on — and a
+        // key pressed with the pointer still elsewhere is now correctly ignored,
+        // which made the whole run fail by one step for a reason that had
+        // nothing to do with the keys. In use the pointer is on the panel for
+        // the whole gesture anyway, so this is also the more faithful shape.
+        record(at: 0.6, key: "→", kVK_RightArrow, expected: 0, onPanel: true)
+        record(at: 1.1, key: "→", kVK_RightArrow, expected: min(1, count - 1), onPanel: true)
+        record(at: 1.6, key: "←", kVK_LeftArrow, expected: 0, onPanel: true)
+        record(at: 2.1, key: "←", kVK_LeftArrow, expected: 0, onPanel: true)
 
         // The pointer's half of the same highlight. The arrow keys and the
         // mouse now write to one piece of state, so a change that satisfied the
         // keyboard could have quietly stopped the hover reaching it — and the
         // hover is what reveals a thumbnail's close and zoom buttons.
-        let restore = NSEvent.mouseLocation
         record(at: 2.6, key: "hover", expected: 0) { moveIntoFirstThumbnail() }
         record(at: 3.1, key: "away", expected: nil) { move(to: CGPoint(x: 4, y: 4)) }
 
-        step(3.6) {
+        // And the rule that sends the keys back where they belong. With the
+        // pointer off the panel, → is not the panel's key: it has to reach the
+        // application the user is actually working in, leaving the highlight
+        // exactly as the line above left it. This is the regression guard for a
+        // preview that ate ←, →, Escape, Return and Space out of whatever was
+        // being typed into, for as long as the pointer sat near the Dock.
+        record(at: 3.6, key: "→ off", kVK_RightArrow, expected: nil)
+
+        step(4.2) {
             move(to: restore)
             report()
         }
 
         NSApp.run()
+    }
+
+    /// Puts the pointer just inside the panel's top edge — on the panel, so the
+    /// keys are its own, but clear of every thumbnail, so nothing is highlighted
+    /// by arriving there.
+    private static func moveOntoPanelMargin() {
+        guard let panel = NSApp.windows.first(where: { $0.isVisible && $0 is DockPreviewPanel })
+        else { return }
+        move(to: CGPoint(x: panel.frame.midX, y: panel.frame.maxY - 3))
     }
 
     /// Puts the pointer inside the first thumbnail's picture.
@@ -142,9 +172,13 @@ enum DockKeySelfTest {
     }
 
     private static func record(
-        at delay: TimeInterval, key: String, _ keyCode: Int, expected: Int?
+        at delay: TimeInterval, key: String, _ keyCode: Int, expected: Int?,
+        onPanel: Bool = false
     ) {
-        record(at: delay, key: key, expected: expected) { press(keyCode) }
+        record(at: delay, key: key, expected: expected) {
+            if onPanel { moveOntoPanelMargin() }
+            press(keyCode)
+        }
     }
 
     /// Does something to the panel and writes down what the highlight became.
@@ -187,6 +221,8 @@ enum DockKeySelfTest {
 
         print("  ✓ ← and → move the highlight along the row, and it stops at the")
         print("    ends rather than wrapping.")
+        print("  ✓ With the pointer off the panel the same keys are left alone,")
+        print("    so they reach the application the user is working in.")
         exit(0)
     }
 

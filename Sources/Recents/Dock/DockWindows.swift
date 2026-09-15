@@ -82,13 +82,20 @@ enum DockWindows {
     }
 
     private static func applicationTarget(for tile: DockProbe.Tile) -> Target? {
-        let app = runningApplication(for: tile)
-        let url = app?.bundleURL ?? tile.url
-
         // The dot decides. See the note at the top of this file: a tile for an
         // app that is not running has nothing behind it to preview, and the
         // Dock's own answer about its own indicator is preferred to ours. The
         // workspace stands in only when the Dock declines to answer.
+        //
+        // Asked before anything else, because the alternative reads the
+        // tile's bundle off disk to look its process up — about 10 ms on the
+        // main thread for an app that is not running, paid on every tile the
+        // pointer crosses on its way to one that is.
+        if tile.isRunning == false { return nil }
+
+        let app = runningApplication(for: tile)
+        let url = app?.bundleURL ?? tile.url
+
         guard tile.isRunning ?? (app != nil) else { return nil }
 
         // Still read from the bundle when it comes to it: an app running under
@@ -108,6 +115,7 @@ enum DockWindows {
               AppWindowCapture.isCaptureAllowed(bundleID: bundleID)
         else { return nil }
 
+        if let pid = app?.processIdentifier { prepareForActions(pid: pid) }
         let windows = app.map { orderedWindows(forPID: $0.processIdentifier) } ?? []
         let still = windows.isEmpty
             ? AppWindowCapture.shared.capture(forBundleID: bundleID)
@@ -149,6 +157,7 @@ enum DockWindows {
               bundleID != Bundle.main.bundleIdentifier,
               AppWindowCapture.isCaptureAllowed(bundleID: bundleID)
         else { return nil }
+        prepareForActions(pid: window.pid)
 
         return Target(
             name: app?.localizedName ?? tile.title,
@@ -214,10 +223,27 @@ enum DockWindows {
     @discardableResult
     static func activate(window: WindowServerCapture.WindowRef) -> ActionOutcome {
         guard let element = element(for: window) else { return .noElement }
+
+        // The un-minimize is allowed to fail quietly. A window that is not
+        // minimized may refuse the attribute outright, and that is no reason to
+        // call bringing it forward a failure.
         AXUIElementSetAttributeValue(
             element, kAXMinimizedAttribute as CFString, kCFBooleanFalse
         )
-        AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+
+        // The raise is the decisive one, and its result used to be discarded
+        // just as the line above it still is — which left this able to report
+        // nothing but `.noElement`. Resolving an element is not the same as
+        // being able to act on it: an application can hand one back and then
+        // refuse the action, and every window that did returned `.done`. The
+        // panel read that as success and dismissed itself, and the application
+        // was brought forward regardless — which is the same "came forward
+        // showing some other window" failure the note above describes, reached
+        // by the other road. `attempt` in `DockPreviewView` has been ready to
+        // say so all along; nothing ever handed it a failure to say it about.
+        let error = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+        guard error == .success else { return .raiseFailed(error) }
+
         NSRunningApplication(processIdentifier: window.pid)?.activate()
         return .done
     }
@@ -252,6 +278,7 @@ enum DockWindows {
         case noButton
         case buttonDisabled
         case pressFailed(AXError)
+        case raiseFailed(AXError)
 
         var isSuccess: Bool { self == .done }
 
@@ -262,6 +289,7 @@ enum DockWindows {
             case .noButton: return "window has no such title-bar button"
             case .buttonDisabled: return "title-bar button is disabled"
             case .pressFailed(let error): return "press refused (AXError \(error.rawValue))"
+            case .raiseFailed(let error): return "raise refused (AXError \(error.rawValue))"
             }
         }
     }
@@ -388,10 +416,18 @@ enum DockWindows {
     /// click cannot lead back to the thing in the picture. Opening the document
     /// it shows is as close as it gets, and it is exactly what someone hovering
     /// Word's tile to see which paper they left in it is asking for. With no
-    /// document to name, the app is opened and lands in a new empty window,
-    /// which the thumbnail says out loud before it is clicked.
-    static func open(_ target: Target) {
-        guard let application = target.applicationURL else { return }
+    /// document to name, the app is opened, which for an app that is already
+    /// running is a reopen: it restores or creates a window, which is what the
+    /// thumbnail says out loud before it is clicked.
+    ///
+    /// Returns whether there was anything to ask, not whether a window appeared.
+    /// Both calls below hand the request to the application and to LaunchServices
+    /// and answer on their own time; the one thing that can be settled here is
+    /// that a tile with no resolvable bundle has nobody to ask, which used to be
+    /// a click that silently did nothing at all.
+    @discardableResult
+    static func open(_ target: Target) -> Bool {
+        guard let application = target.applicationURL else { return false }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
 
@@ -402,6 +438,36 @@ enum DockWindows {
         } else {
             NSWorkspace.shared.openApplication(at: application, configuration: configuration)
         }
+        return true
+    }
+
+    /// What clicking a *window* thumbnail does: bring that window forward, and
+    /// when it cannot be reached, ask its application for a window instead.
+    ///
+    /// The fallback is the whole point. Some applications do not expose a
+    /// minimized window through Accessibility at all — Notes, measured on macOS
+    /// 26 — so `activate` has nothing to raise and nothing to press, and the
+    /// panel's only honest answer used to be a badge reading "Couldn't reach
+    /// it". Honest, and useless: the user clicked a picture of their window
+    /// because they wanted to be looking at that app, and telling them the road
+    /// is closed leaves them exactly where they were.
+    ///
+    /// Opening the application is a road that does not run through Accessibility
+    /// at all. For an app that is already running it is a reopen, which the app
+    /// answers itself by unminimising what it has or making a new window — the
+    /// same thing clicking its Dock tile does, and rather more reliably than
+    /// poking at an element it declined to hand over.
+    ///
+    /// It is a fallback and not the first move, because it is the weaker answer:
+    /// `activate` returns the user to the exact window in the picture, while
+    /// this returns them to the app and lets it choose. The badge survives for
+    /// the case where both fail, which is now only a tile whose bundle cannot be
+    /// resolved — there is genuinely nothing left to do about that one.
+    static func activateOrOpen(
+        window: WindowServerCapture.WindowRef, of target: Target
+    ) -> Bool {
+        if activate(window: window).isSuccess { return true }
+        return open(target)
     }
 
     // MARK: - Which document a preview is of
@@ -541,6 +607,7 @@ enum DockWindows {
 
         let application = AXUIElementCreateApplication(window.pid)
         AXUIElementSetMessagingTimeout(application, 0.5)
+        enableManualAccessibility(of: application, pid: window.pid)
 
         if let found = match(window, among: elements(kAXWindowsAttribute, of: application)) {
             return (found, .windows)
@@ -565,6 +632,91 @@ enum DockWindows {
         }
 
         return (nil, .none)
+    }
+
+    /// Asks a Chromium-based application to build its accessibility tree.
+    ///
+    /// Chromium — and so Electron, and so Visual Studio Code, Slack, Discord,
+    /// Arc and most of what a developer keeps in the Dock — does not expose one
+    /// by default. It is expensive to maintain, so it is built only once
+    /// something asks, and `AXManualAccessibility` is the switch Chromium added
+    /// for exactly that. Until it is set, the application answers `AXWindows`
+    /// with an empty array and every one of the four routes below comes back
+    /// with nothing.
+    ///
+    /// That was not a cosmetic gap. `activate`, `close` and `zoom` all begin by
+    /// resolving the window and give up when they cannot, so clicking a Dock
+    /// preview thumbnail of a VS Code window did nothing at all — the panel said
+    /// "Couldn't reach it" and the window stayed where it was.
+    ///
+    /// `AXManualAccessibility` rather than `AXEnhancedUserInterface`, which is
+    /// the older switch and reaches the same tree: that one tells Chromium a
+    /// screen reader is present and has a long history of side effects, window
+    /// resizing among them. This one exists to mean only what is being asked.
+    ///
+    /// Set once per process. The tree is built asynchronously, so the first
+    /// resolve after setting it may still come back empty — which is why this is
+    /// also reached from `target(for:)` while the pointer is merely dwelling on
+    /// the tile, a good fraction of a second before any click.
+    private static var manualAccessibilityPIDs: Set<pid_t> = []
+
+    private static func enableManualAccessibility(of application: AXUIElement, pid: pid_t) {
+        guard noteManualAccessibility(pid: pid) else { return }
+        AXUIElementSetAttributeValue(
+            application, "AXManualAccessibility" as CFString, kCFBooleanTrue
+        )
+    }
+
+    /// Records that a process has been asked, and reports whether it still
+    /// needed asking. Separate from the asking itself because the two happen on
+    /// different threads — see `prepareForActions`.
+    private static func noteManualAccessibility(pid: pid_t) -> Bool {
+        guard !manualAccessibilityPIDs.contains(pid) else { return false }
+
+        // Processes that have since quit are dropped before the new one goes in.
+        // The set is only ever consulted in order to skip work, so an entry that
+        // outlives its process is not merely stale but actively wrong: PIDs are
+        // recycled, and a later application handed a number still sitting in
+        // here would be skipped — left in exactly the state this exists to get
+        // an application out of, and for the life of the process, since nothing
+        // ever removed an entry. A menu-bar app runs for weeks, which is long
+        // enough for the kernel to come back round.
+        //
+        // Swept on insertion rather than watched for: this runs once per
+        // application per session, the set holds one entry per application whose
+        // tile has been hovered, and a lookup apiece is far less than the round
+        // trip being avoided.
+        manualAccessibilityPIDs = manualAccessibilityPIDs.filter {
+            NSRunningApplication(processIdentifier: $0) != nil
+        }
+        manualAccessibilityPIDs.insert(pid)
+        return true
+    }
+
+    /// Warms the accessibility tree of the application behind a tile, so that a
+    /// click on one of its thumbnails a moment later has something to act on.
+    static func prepareForActions(pid: pid_t) {
+        guard AXIsProcessTrusted(), noteManualAccessibility(pid: pid) else { return }
+
+        // Off the main thread, unlike the resolve path that shares this switch.
+        // This one is reached from mere hover — `target(for:)` is called when the
+        // pointer settles on a tile, a good fraction of a second before any click
+        // — and it is a cross-process Accessibility write bounded by nothing but
+        // the messaging timeout on the line below. An application that is busy or
+        // wedged simply does not answer, and this whole app is one thread: resting
+        // the pointer on such an application's Dock icon would take the deck, the
+        // panel and the hotkey down with it for as long as the timeout ran.
+        //
+        // Nothing waits on the result, and nothing could usefully: the tree is
+        // built asynchronously whatever thread asks for it, which is exactly why
+        // the click path already tolerates a first resolve that comes back empty.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let application = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(application, 0.5)
+            AXUIElementSetAttributeValue(
+                application, "AXManualAccessibility" as CFString, kCFBooleanTrue
+            )
+        }
     }
 
     private static func elements(

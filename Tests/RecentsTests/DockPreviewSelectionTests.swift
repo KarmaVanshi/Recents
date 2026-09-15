@@ -79,4 +79,51 @@ struct DockPreviewSelectionTests {
         #expect(step(from: 5, by: 1, count: 2) == 1)
         #expect(step(from: 5, by: -1, count: 2) == 1)
     }
+
+    // MARK: - Whose keys are they
+
+    private let panel = CGRect(x: 100, y: 200, width: 400, height: 300)
+
+    @Test("A pointer on the panel means the keys were aimed at the panel")
+    func pointerOnThePanelOwnsTheKeys() {
+        #expect(DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel, pointer: CGPoint(x: 300, y: 350)
+        ))
+    }
+
+    @Test("A pointer anywhere else leaves the keys to the application in front")
+    func pointerOffThePanelDoesNot() {
+        // The bug this rule exists for: a preview appears from resting the
+        // pointer near the Dock, and every key it answers is a key taken out of
+        // whatever the user is typing into. The tile itself counts as off — that
+        // is someone looking at a preview, not driving it.
+        #expect(!DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel, pointer: CGPoint(x: 300, y: 100)
+        ))
+        #expect(!DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel, pointer: CGPoint(x: 0, y: 0)
+        ))
+    }
+
+    @Test("A pointer resting on the very edge still counts as on the panel")
+    func theEdgeIsForgiving() {
+        #expect(DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel, pointer: CGPoint(x: 100, y: 200), margin: 6
+        ))
+        #expect(DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel, pointer: CGPoint(x: 97, y: 200), margin: 6
+        ))
+        #expect(!DockPreviewSelection.panelOwnsKeyboard(
+            panel: panel, pointer: CGPoint(x: 90, y: 200), margin: 6
+        ))
+    }
+
+    @Test("No panel means no claim on the keyboard at all")
+    func anEmptyPanelOwnsNothing() {
+        // A panel built and never shown has a degenerate frame, and the margin
+        // alone must not be enough to make it start swallowing keystrokes.
+        #expect(!DockPreviewSelection.panelOwnsKeyboard(
+            panel: .zero, pointer: .zero
+        ))
+    }
 }

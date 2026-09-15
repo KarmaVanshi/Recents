@@ -219,8 +219,10 @@ more than 90pt up — or flicked with >220pt of projected momentum — is forgot
 | `Recents --selftest-live` | List every window, which are minimised, which are drawing |
 | `Recents --selftest-live --verbose` | …preceded by the raw, unfiltered window list |
 | `Recents --selftest-dock` | Check the Dock still exposes its tiles through Accessibility, and that hovering one would resolve to real windows |
+| `Recents --selftest-dock --panel [app]` | Put a real preview panel on screen for ten seconds and print the `screencapture` line that photographs it |
 | `Recents --selftest-dock-close` | Click the close button on a real preview thumbnail, against a scratch window the test makes |
 | `Recents --selftest-dock-keys` | Press the arrow keys at a real preview and read back which thumbnail highlighted |
+| `Recents --selftest-dock-sweep` | Sweep the pointer along a real preview's row and measure how far the highlight runs behind it |
 | `Recents --selftest-menu` | Press ↓ at the real status item menu and read back what it highlighted |
 | `Recents --selftest-office` | Check Word/Excel/PowerPoint recents against their private stores (exit 0 = match) |
 | `Recents --selftest-gesture [--fingers N] [--taps N]` | Score the bound trackpad gesture live for 45s; the flags try another shape without changing the setting |
@@ -300,7 +302,8 @@ on the machine in front of you.
     │   ├── DockPreviewKeys.swift      the event tap that reads ←/→/↩/⎋
     │   ├── DockSelfTest.swift         --selftest-dock
     │   ├── DockCloseSelfTest.swift    --selftest-dock-close
-    │   └── DockKeySelfTest.swift      --selftest-dock-keys
+    │   ├── DockKeySelfTest.swift      --selftest-dock-keys
+    │   └── DockSweepSelfTest.swift    --selftest-dock-sweep
     ├── Input/
     │   ├── HotKey.swift               Carbon global shortcut (no Accessibility)
     │   ├── TrackpadGesture.swift      private multitouch tap-to-summon

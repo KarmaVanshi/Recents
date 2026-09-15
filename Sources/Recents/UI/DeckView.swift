@@ -175,7 +175,7 @@ struct DeckView: View {
                 if let drillDown {
                     // Says where you are and how to get back, since a sub-deck
                     // of documents is otherwise indistinguishable from the deck.
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: drillDown.app.url.path))
+                    Image(nsImage: DeckIcon.forFile(drillDown.app.url.path))
                         .resizable()
                         .frame(width: 18, height: 18)
                     Text(drillDown.app.displayName)

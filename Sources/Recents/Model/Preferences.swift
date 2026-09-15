@@ -71,10 +71,12 @@ final class Preferences {
             // appear as app cards, so folders are off by default.
             Key.includeFolders: false,
             Key.documentCount: Preferences.defaultDocumentCount,
-            // Off by default. The main deck's narrowness is a design decision
-            // rather than a limitation — see `showAllFiles` — so widening it is
-            // the user's to ask for, not ours to assume.
-            Key.showAllFiles: false,
+            // On by default. A deck that will not show the file you had open
+            // five minutes ago, because it happened to be open in Numbers, is
+            // answering a question its own name does not ask — see
+            // `showAllFiles`. Narrowing it back to Preview's own reading list
+            // is the one the user asks for now.
+            Key.showAllFiles: true,
             Key.allFilesCount: Preferences.defaultAllFilesCount,
             Key.appearance: DeckAppearance.liquidGlass.rawValue,
             Key.glassStyle: GlassStyle.regular.rawValue,
@@ -193,25 +195,28 @@ final class Preferences {
     static let defaultDocumentCount = 7
     static let documentCountRange = 1...25
 
-    /// When on, the main deck's documents are every file macOS recorded rather
-    /// than only the ones read in Preview.
+    /// When on — which is now the default — the main deck's documents are every
+    /// file macOS recorded, whichever app opened it. Off, they are only the ones
+    /// read in Preview.
     ///
-    /// The narrow default is a real design decision, not an oversight: every
-    /// other app's recents already sit one swipe behind that app's own card, so
-    /// a flat list of all of them says the same thing twice, and says it without
-    /// attribution. But the swipe has to be *known about* to be used, and a deck
-    /// that will not simply show you the file you had open five minutes ago —
-    /// because it happened to be open in Numbers — is answering a question its
-    /// own name does not ask.
+    /// The narrow reading had a real argument behind it: every other app's
+    /// recents already sit one swipe behind that app's own card, so a flat list
+    /// of all of them says the same thing twice, and says it without
+    /// attribution. What that argument left out is that the swipe has to be
+    /// *known about* to be used. A deck called Recents that will not simply show
+    /// you the file you had open five minutes ago — because it happened to be
+    /// open in Numbers — is answering a question its own name does not ask, and
+    /// no amount of correctness one card-swipe away makes up for it.
     ///
-    /// So this is an opt-in rather than a new default, and it changes the
-    /// *source* rather than loosening a filter: on, the deck reads the Apple
-    /// menu's own global `RecentDocuments.sfl4`, which is the actual list of
-    /// every file macOS thinks you used, in the actual order it shows them.
-    /// Merging sixty per-app lists by timestamp would have produced a longer
-    /// deck and a fabricated order; this produces a longer deck that is still
-    /// exactly the Apple menu's, which is the claim the whole app rests on.
-    var showAllFiles: Bool = false {
+    /// It changes the *source* rather than loosening a filter: on, the deck
+    /// reads every per-app list unioned with the Apple menu's global
+    /// `RecentDocuments.sfl4` and orders the result by when each file was last
+    /// used. See `RecentsStore.mergedDocumentOrder` for why the global list
+    /// alone is not enough, and why a timestamp order is the only one that
+    /// exists across apps. That order is the price of the wider deck, and it is
+    /// declared rather than hidden: those cards are marked `.spotlight`, and
+    /// `--parity` reports them as unchecked instead of quietly passing them.
+    var showAllFiles: Bool = true {
         didSet { persist(showAllFiles, forKey: Key.showAllFiles, rebuildsDeck: showAllFiles != oldValue) }
     }
 

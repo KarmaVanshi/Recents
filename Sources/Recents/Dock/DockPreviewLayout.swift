@@ -120,6 +120,36 @@ struct DockPreviewLayout {
         )
     }
 
+    /// Which thumbnail a point is over, measured down and right from the panel's
+    /// top-left corner as `closeButtonCentre` is — or nil over the header, the
+    /// gaps between pictures, or the padding around the row.
+    ///
+    /// This is what decides the hover highlight, and it is decided here in
+    /// plain arithmetic rather than left to SwiftUI's `onHover`. That modifier
+    /// only ever fired when the pointer *entered* the panel: the hosting view
+    /// received every mouse-moved event after that — measured, a hundred per
+    /// sweep — and SwiftUI updated nothing from them, because the panel is a
+    /// window that can never become key and SwiftUI's hover tracking does not
+    /// follow the pointer in one. The highlight landed on whichever thumbnail
+    /// the pointer came in over and stayed there while the pointer crossed the
+    /// rest of the row, moving only when a frame arriving for some window
+    /// happened to rebuild the tracking areas. The events are delivered to
+    /// AppKit regardless, so the hit test is done there, against the same
+    /// numbers that place the thumbnails in the first place.
+    ///
+    /// A column runs from the top of its picture to the bottom of the panel,
+    /// caption included: the caption is the thumbnail's name and pointing at
+    /// it is pointing at the thumbnail.
+    func thumbnailIndex(at point: CGPoint) -> Int? {
+        guard point.y >= Self.padding + Self.headerHeight + Self.headerGap else { return nil }
+        var left = Self.padding
+        for (index, width) in widths.enumerated() {
+            if point.x >= left && point.x < left + width { return index }
+            left += width + Self.spacing
+        }
+        return nil
+    }
+
     /// How wide the thumbnails and the gaps between them come to, floored so the
     /// header has somewhere to live. See `minimumRowWidth`.
     ///

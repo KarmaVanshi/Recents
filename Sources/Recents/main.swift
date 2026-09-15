@@ -25,6 +25,10 @@ if CommandLine.arguments.contains("--selftest-watcher") {
     // thumbnail ended up highlighted. Whether a keystroke reaches a panel that
     // never becomes key is a fact about the window server. See `DockKeySelfTest`.
     MainActor.assumeIsolated { DockKeySelfTest.run() }
+} else if CommandLine.arguments.contains("--selftest-dock-sweep") {
+    // Sweeps the pointer along a real Dock preview's row and measures how far
+    // the highlight runs behind it, stage by stage. See `DockSweepSelfTest`.
+    MainActor.assumeIsolated { DockSweepSelfTest.run() }
 } else if CommandLine.arguments.contains("--selftest-menu") {
     // Presses ↓ at the real status item menu and reads back what the menu
     // highlighted. Whether a menu answers the keyboard is a fact about AppKit

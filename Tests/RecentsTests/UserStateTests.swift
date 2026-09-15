@@ -243,6 +243,25 @@ struct UserStateTests {
         #expect(state.isSuppressed(a) == false)
     }
 
+    @Test("A corrupt state file is kept, so a later pin cannot quietly overwrite the only copy")
+    func corruptFileIsKept() {
+        let scratch = ScratchDirectory()
+        let original = "{ a year of pins, in a shape this build cannot read"
+        scratch.writeFile("state.json", contents: original)
+
+        // Loading is what moves it aside, but pinning is the write that used to
+        // land on top of it — so the test has to get past that to mean anything.
+        let loaded = state(in: scratch)
+        loaded.togglePin(a)
+
+        let kept = scratch.url.appendingPathComponent("state.json.unreadable")
+        #expect(FileManager.default.fileExists(atPath: kept.path))
+        #expect((try? String(contentsOf: kept, encoding: .utf8)) == original)
+
+        // And the app carries on with a working file of its own.
+        #expect(state(in: scratch).isPinned(a))
+    }
+
     // MARK: - Migration from the undated format
 
     @Test("An undated file from an earlier build is read rather than discarded")
