@@ -4,7 +4,7 @@ A macOS menu-bar app that replaces the Apple menu's **Recent Items** with a
 browsable deck of cards — each one showing the app's actual last window or the
 document's actual first page, rather than a name and a generic icon.
 
-Press **⇧⌘Space** anywhere. There is no Dock icon.
+Press **⇧⌘Space** anywhere. 
 
 ```bash
 ./build.sh            # debug build → Recents.app
